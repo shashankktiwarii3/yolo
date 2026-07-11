@@ -1636,11 +1636,15 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+        # if m is HighFreqInject:
+        #     c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
+        #     c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
+        #     args = [c1, c2]
+        #     print(f"[HFI parse] c1(source/P2)={c1}, c2(target/P3)={c2}")
         if m is HighFreqInject:
-            c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
-            c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
-            args = [c1, c2]
-            print(f"[HFI parse] c1(source/P2)={c1}, c2(target/P3)={c2}")
+            c1 = ch[f[1]]
+            c2 = ch[f[0]]
+            args = [c1, c2, *args]     # <-- append YAML flags so [use_gate, use_unsharp] flow through
         elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)

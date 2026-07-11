@@ -2067,34 +2067,82 @@ class RealNVP(nn.Module):
         return self.prior.log_prob(z) + log_det
 
 
-class HighFreqInject(nn.Module):
-    """Injects high-frequency spatial details from a higher-resolution feature map (e.g., P2) into a lower-resolution map (e.g., P3)."""
+# class HighFreqInject(nn.Module):
+#     """Injects high-frequency spatial details from a higher-resolution feature map (e.g., P2) into a lower-resolution map (e.g., P3)."""
     
-    def __init__(self, c1, c2): 
+#     def __init__(self, c1, c2): 
+#         super().__init__()
+#         # c1 = source channels (P2), c2 = target channels (P3)
+        
+#         # Laplacian kernel for edge detection (high-pass filter)
+#         self.laplacian = nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False)
+#         kernel = torch.tensor([[[[0., 1., 0.],
+#                                  [1., -4., 1.],
+#                                  [0., 1., 0.]]]], dtype=torch.float32)
+        
+#         # Safely register the frozen kernel as a non-learnable parameter
+#         self.laplacian.weight = nn.Parameter(kernel.repeat(c1, 1, 1, 1), requires_grad=False)
+        
+#         # Projection to match target channels AND downsample spatial dimensions
+#         # k=3, s=2 cuts the spatial dimensions in half to match the P3 layer
+#         self.proj = Conv(c1, c2, k=3, s=2) 
+
+#     def forward(self, x):
+#         target, source = x[0], x[1]
+#         edges = self.laplacian(source)
+#         projected = self.proj(edges)
+    
+#         if not getattr(self, "_dbg_printed", False):
+#             print(f"[HFI fwd] target={tuple(target.shape)}  source={tuple(source.shape)}  "
+#                   f"proj_out={tuple(projected.shape)}")
+#             self._dbg_printed = True
+    
+#         return target + projected
+
+
+
+class HighFreqInject(nn.Module):
+    """v2: lossless space-to-depth transfer of P2 high-frequency detail into P3.
+
+    vs v1:
+      1. PixelUnshuffle replaces stride-2 conv -> downsample is lossless (SPD-Conv style)
+      2. Dual-band high-pass: frozen Laplacian + param-free unsharp residual
+      3. Optional spatial gate from target suppresses background injection
+      4. 1D per-channel gain (gamma) -> MuSGD-safe, calibratable fusion strength
+    """
+
+    def __init__(self, c1, c2, use_gate=True, use_unsharp=True):
         super().__init__()
-        # c1 = source channels (P2), c2 = target channels (P3)
-        
-        # Laplacian kernel for edge detection (high-pass filter)
+        # band 1: frozen depthwise Laplacian (isotropic 2nd-derivative high-pass)
         self.laplacian = nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False)
-        kernel = torch.tensor([[[[0., 1., 0.],
-                                 [1., -4., 1.],
-                                 [0., 1., 0.]]]], dtype=torch.float32)
-        
-        # Safely register the frozen kernel as a non-learnable parameter
-        self.laplacian.weight = nn.Parameter(kernel.repeat(c1, 1, 1, 1), requires_grad=False)
-        
-        # Projection to match target channels AND downsample spatial dimensions
-        # k=3, s=2 cuts the spatial dimensions in half to match the P3 layer
-        self.proj = Conv(c1, c2, k=3, s=2) 
+        k = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]])
+        self.laplacian.weight = nn.Parameter(k.repeat(c1, 1, 1, 1), requires_grad=False)
+
+        # band 2: parameter-free unsharp residual (local contrast high-pass)
+        self.use_unsharp = use_unsharp
+        self.pool = nn.AvgPool2d(3, 1, 1)
+
+        # lossless 2x downsample + fuse/project
+        n_bands = 2 if use_unsharp else 1
+        self.s2d = nn.PixelUnshuffle(2)                    # (B,C,2H,2W)->(B,4C,H,W), 0 params
+        self.proj = Conv(c1 * n_bands * 4, c2, k=1)        # 1x1 fuse to target channels
+
+        # spatial gate from target: where to inject
+        self.use_gate = use_gate
+        if use_gate:
+            self.gate = nn.Conv2d(c2, 1, 1)
+            nn.init.zeros_(self.gate.weight)
+            nn.init.constant_(self.gate.bias, 1.0)         # starts ~open (sigmoid(1)=0.73)
+
+        # 1D per-channel gain -> SGD group under MuSGD, never hits Muon's 2D assert
+        self.gamma = nn.Parameter(torch.ones(c2))
 
     def forward(self, x):
         target, source = x[0], x[1]
-        edges = self.laplacian(source)
-        projected = self.proj(edges)
-    
-        if not getattr(self, "_dbg_printed", False):
-            print(f"[HFI fwd] target={tuple(target.shape)}  source={tuple(source.shape)}  "
-                  f"proj_out={tuple(projected.shape)}")
-            self._dbg_printed = True
-    
-        return target + projected
+        bands = [self.laplacian(source)]
+        if self.use_unsharp:
+            bands.append(source - self.pool(source))
+        hf = self.proj(self.s2d(torch.cat(bands, 1)))      # lossless ↓2, (B,c2,H,W)
+        if self.use_gate:
+            hf = hf * torch.sigmoid(self.gate(target))
+        return target + hf * self.gamma.view(1, -1, 1, 1)
