@@ -1636,7 +1636,12 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in base_modules:
+        if m is HighFreqInject:
+            c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
+            c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
+            args = [c1, c2]
+            print(f"[HFI parse] c1(source/P2)={c1}, c2(target/P3)={c2}")
+        elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -1660,10 +1665,7 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
-        elif m is HighFreqInject:
-            c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
-            c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
-            args = [c1, c2]
+        
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
