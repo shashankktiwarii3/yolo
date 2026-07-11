@@ -106,13 +106,56 @@ class DFLoss(nn.Module):
         ).mean(-1, keepdim=True)
 
 
+# class BboxLoss(nn.Module):
+#     """Criterion class for computing training losses for bounding boxes."""
+
+#     def __init__(self, reg_max: int = 16):
+#         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
+#         super().__init__()
+#         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+
+#     def forward(
+#         self,
+#         pred_dist: torch.Tensor,
+#         pred_bboxes: torch.Tensor,
+#         anchor_points: torch.Tensor,
+#         target_bboxes: torch.Tensor,
+#         target_scores: torch.Tensor,
+#         target_scores_sum: torch.Tensor,
+#         fg_mask: torch.Tensor,
+#         imgsz: torch.Tensor,
+#         stride: torch.Tensor,
+#     ) -> tuple[torch.Tensor, torch.Tensor]:
+#         """Compute IoU and DFL losses for bounding boxes."""
+#         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+#         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+#         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
 class BboxLoss(nn.Module):
-    """Criterion class for computing training losses for bounding boxes."""
+    """Criterion class for computing training losses for bounding boxes (CIoU + optional NWD blend)."""
+
+    # --- NWD blend config: set per-run in the training script, e.g. BboxLoss.nwd_alpha = 0.5 ---
+    nwd_alpha = 0.5            # 0.0 = pure CIoU (bit-exact baseline arm); 0.5 = equal blend
+    nwd_C = 12.8               # NWD normalization constant, in PIXELS at network input scale
+    nwd_size_adaptive = False  # True: alpha ramps from nwd_alpha (<=16px objects) to 0 (>=32px)
 
     def __init__(self, reg_max: int = 16):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+
+    @staticmethod
+    def _nwd(pred, target, C):
+        """Normalized Wasserstein similarity between xyxy boxes in PIXEL units. Returns (M, 1)."""
+        pred, target = pred.float(), target.float()  # AMP-safe: fp16 overflows on squared pixel distances
+        p_cx = (pred[..., 0] + pred[..., 2]) * 0.5
+        p_cy = (pred[..., 1] + pred[..., 3]) * 0.5
+        t_cx = (target[..., 0] + target[..., 2]) * 0.5
+        t_cy = (target[..., 1] + target[..., 3]) * 0.5
+        p_w, p_h = pred[..., 2] - pred[..., 0], pred[..., 3] - pred[..., 1]
+        t_w, t_h = target[..., 2] - target[..., 0], target[..., 3] - target[..., 1]
+        w2 = (p_cx - t_cx) ** 2 + (p_cy - t_cy) ** 2 + ((p_w - t_w) ** 2 + (p_h - t_h) ** 2) * 0.25
+        return torch.exp(-torch.sqrt(w2.clamp(min=1e-7)) / C).unsqueeze(-1)
 
     def forward(
         self,
@@ -126,11 +169,38 @@ class BboxLoss(nn.Module):
         imgsz: torch.Tensor,
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for bounding boxes."""
+        """Compute NWD-blended IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
+        if self.nwd_alpha > 0:
+            
+            # boxes arrive in GRID units (call site divides by stride_tensor);
+            # stride (N,1) broadcasts over (bs,N,4) -> recover PIXEL units for NWD
+            pred_px = (pred_bboxes * stride)[fg_mask]
+            tgt_px = (target_bboxes * stride)[fg_mask]
+            nwd = self._nwd(pred_px, tgt_px, self.nwd_C).to(iou.dtype)
+
+            if not hasattr(self, "_nwd_dbg"):
+                print(f"[NWD] tgt_px max={tgt_px.max():.1f} nwd mean={nwd.mean():.3f} min={nwd.min():.3f} max={nwd.max():.3f}")
+                self._nwd_dbg = True
+
+                
+            if self.nwd_size_adaptive:
+                size = torch.sqrt(
+                    ((tgt_px[..., 2] - tgt_px[..., 0]) * (tgt_px[..., 3] - tgt_px[..., 1])).clamp(min=0)
+                ).unsqueeze(-1)
+                a = self.nwd_alpha * ((32.0 - size) / 16.0).clamp(0.0, 1.0)  # full blend <=16px, pure CIoU >=32px
+            else:
+                a = self.nwd_alpha
+            sim = (1 - a) * iou + a * nwd
+        else:
+            sim = iou  # alpha=0 -> bit-exact original CIoU path, zero overhead
+
+        loss_iou = ((1.0 - sim) * weight).sum() / target_scores_sum
+
+        # DFL loss
+        # ... UNCHANGED — keep your existing if self.dfl_loss / else block verbatim ...
         # DFL loss
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
