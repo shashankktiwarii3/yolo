@@ -34,7 +34,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, eps: float = 1e-7) -> torch.Ten
         - Output approximates US'V^T where S' has diagonal entries ~ Uniform(0.5, 1.5).
         - Does not produce exact UV^T but works well empirically for neural network optimization.
     """
-    assert len(G.shape) == 2, f"[MUON] got non-2D grad, shape={tuple(G.shape)}"
+    assert len(G.shape) == 2
     X = G.bfloat16()
     X /= X.norm() + eps  # ensure top singular value <= 1
     if G.size(0) > G.size(1):
@@ -91,7 +91,7 @@ def muon_update(grad: torch.Tensor, momentum: torch.Tensor, beta: float = 0.95, 
     update = grad.lerp(momentum, beta) if nesterov else momentum
     if update.ndim == 4:  # for the case of conv filters
         update = update.view(len(update), -1)
-    print(f"[MUON] orthogonalizing param grad shape={tuple(update.shape)}")
+    #print(f"[MUON] orthogonalizing param grad shape={tuple(update.shape)}")
     update = zeropower_via_newtonschulz5(update)
     update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
     return update

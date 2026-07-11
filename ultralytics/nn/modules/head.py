@@ -44,7 +44,7 @@ class SubPixelRefine(nn.Module):
         freqs = 2 * math.pi * torch.arange(1, n_bands + 1, dtype=torch.float32)
         self.register_buffer("freqs", freqs)
         # per-side learnable amplitude, init small so refinement starts ~no-op
-        self.amp = nn.Parameter(torch.full((1, 4 * reg_max, 1), 0.1))
+        self.amp = nn.Parameter(torch.full((4 * reg_max,), 0.1))         # 1D — goes to SGD group, safe
 
     def forward(self, feats: list[torch.Tensor]) -> torch.Tensor:
         """feats: per-level maps. Returns (bs, 4*reg_max, sum(H*W)) in cell units."""
@@ -57,7 +57,7 @@ class SubPixelRefine(nn.Module):
             sin_c, cos_c = c[:, :, : self.n_bands], c[:, :, self.n_bands :]
             phase = torch.sigmoid(sin_c.mean(2, keepdim=True))          # (bs,4rm,1,HW), in [0,1)
             basis = sin_c * torch.sin(f_shape * phase) + cos_c * torch.cos(f_shape * phase)
-            refine = torch.tanh(basis.sum(2)) * 0.5 * self.amp          # (bs,4rm,HW), ~±0.5 cell
+            refine = torch.tanh(basis.sum(2)) * 0.5 * self.amp.view(1, -1, 1)
             outs.append(refine)
         return torch.cat(outs, dim=-1)
 
