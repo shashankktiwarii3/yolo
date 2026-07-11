@@ -2065,3 +2065,34 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+class HighFreqInject(nn.Module):
+    """Injects high-frequency spatial details from a higher-resolution feature map (e.g., P2) into a lower-resolution map (e.g., P3)."""
+    
+    def __init__(self, c1, c2): 
+        super().__init__()
+        # c1 = source channels (P2), c2 = target channels (P3)
+        
+        # Laplacian kernel for edge detection (high-pass filter)
+        self.laplacian = nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False)
+        kernel = torch.tensor([[[[0., 1., 0.],
+                                 [1., -4., 1.],
+                                 [0., 1., 0.]]]], dtype=torch.float32)
+        
+        # Safely register the frozen kernel as a non-learnable parameter
+        self.laplacian.weight = nn.Parameter(kernel.repeat(c1, 1, 1, 1), requires_grad=False)
+        
+        # Projection to match target channels AND downsample spatial dimensions
+        # k=3, s=2 cuts the spatial dimensions in half to match the P3 layer
+        self.proj = Conv(c1, c2, k=3, s=2) 
+
+    def forward(self, x):
+        # x is a list: [target_features (P3), source_features (P2)]
+        target, source = x[0], x[1]
+        
+        # Extract edges from the high-res P2 source
+        edges = self.laplacian(source)
+        
+        # Downsample edges to match P3 spatial size, align channels, and add
+        return target + self.proj(edges)

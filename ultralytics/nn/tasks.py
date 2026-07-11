@@ -10,6 +10,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from ultralytics.nn.modules.block import HighFreqInject
+
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -1658,6 +1660,10 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is HighFreqInject:
+            c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
+            c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
+            args = [c1, c2]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
