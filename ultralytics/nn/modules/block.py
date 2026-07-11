@@ -2088,11 +2088,13 @@ class HighFreqInject(nn.Module):
         self.proj = Conv(c1, c2, k=3, s=2) 
 
     def forward(self, x):
-        # x is a list: [target_features (P3), source_features (P2)]
         target, source = x[0], x[1]
-        
-        # Extract edges from the high-res P2 source
         edges = self.laplacian(source)
-        
-        # Downsample edges to match P3 spatial size, align channels, and add
-        return target + self.proj(edges)
+        projected = self.proj(edges)
+    
+        if not getattr(self, "_dbg_printed", False):
+            print(f"[HFI fwd] target={tuple(target.shape)}  source={tuple(source.shape)}  "
+                  f"proj_out={tuple(projected.shape)}")
+            self._dbg_printed = True
+    
+        return target + projected
