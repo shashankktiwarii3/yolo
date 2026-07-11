@@ -135,7 +135,7 @@ class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes (CIoU + optional NWD blend)."""
 
     # --- NWD blend config: set per-run in the training script, e.g. BboxLoss.nwd_alpha = 0.5 ---
-    nwd_alpha = 0.5            # 0.0 = pure CIoU (bit-exact baseline arm); 0.5 = equal blend
+    nwd_alpha = 0.0           # 0.0 = pure CIoU (bit-exact baseline arm); 0.5 = equal blend
     nwd_C = 12.8               # NWD normalization constant, in PIXELS at network input scale
     nwd_size_adaptive = False  # True: alpha ramps from nwd_alpha (<=16px objects) to 0 (>=32px)
 
@@ -185,7 +185,7 @@ class BboxLoss(nn.Module):
                 print(f"[NWD] tgt_px max={tgt_px.max():.1f} nwd mean={nwd.mean():.3f} min={nwd.min():.3f} max={nwd.max():.3f}")
                 self._nwd_dbg = True
 
-                
+
             if self.nwd_size_adaptive:
                 size = torch.sqrt(
                     ((tgt_px[..., 2] - tgt_px[..., 0]) * (tgt_px[..., 3] - tgt_px[..., 1])).clamp(min=0)
