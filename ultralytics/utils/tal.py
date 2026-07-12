@@ -10,20 +10,6 @@ from .metrics import bbox_iou, probiou
 from .ops import xywh2xyxy, xywhr2xyxyxyxy, xyxy2xywh
 from .torch_utils import TORCH_1_11
 
-def bbox2nwd(box1, box2, constant=12.0, eps=1e-7):
-    """Calculates Normalized Gaussian Wasserstein Distance (NWD). Boxes in xyxy format."""
-    x1, y1, x2, y2 = box1.unbind(-1)
-    cx1, cy1, w1, h1 = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
-    
-    x1, y1, x2, y2 = box2.unbind(-1)
-    cx2, cy2, w2, h2 = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
-    
-    center_dist = (cx1 - cx2).pow(2) + (cy1 - cy2).pow(2)
-    wh_dist = 0.25 * ((w1 - w2).pow(2) + (h1 - h2).pow(2))
-    w2_dist = center_dist + wh_dist
-    
-    nwd = torch.exp(-torch.sqrt(w2_dist + eps) / constant)
-    return nwd
 
 class TaskAlignedAssigner(nn.Module):
     """A task-aligned assigner for object detection.
@@ -183,72 +169,36 @@ class TaskAlignedAssigner(nn.Module):
 
         return mask_pos, align_metric, overlaps
 
-    # def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
-    #     """Compute alignment metric given predicted and ground truth bounding boxes.
-
-    #     Args:
-    #         pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
-    #         pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
-    #         gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
-    #         gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
-    #         mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, h*w).
-
-    #     Returns:
-    #         align_metric (torch.Tensor): Alignment metric combining classification and localization.
-    #         overlaps (torch.Tensor): IoU overlaps between predicted and ground truth boxes.
-    #     """
-    #     na = pd_bboxes.shape[-2]
-    #     mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
-    #     overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
-    #     bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
-
-    #     ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
-    #     ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
-    #     ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
-    #     # Get the scores of each grid for each gt cls
-    #     bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]  # b, max_num_obj, h*w
-
-    #     # (b, max_num_obj, 1, 4), (b, 1, h*w, 4)
-    #     pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
-    #     gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
-    #     overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
-
-    #     align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
-    #     return align_metric, overlaps
-
     def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
-        """Compute alignment metric given predicted and ground truth bounding boxes."""
+        """Compute alignment metric given predicted and ground truth bounding boxes.
+
+        Args:
+            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
+            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
+            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
+            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
+            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, h*w).
+
+        Returns:
+            align_metric (torch.Tensor): Alignment metric combining classification and localization.
+            overlaps (torch.Tensor): IoU overlaps between predicted and ground truth boxes.
+        """
         na = pd_bboxes.shape[-2]
         mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
         overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
         bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+
         ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
         ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
         ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
-        
         # Get the scores of each grid for each gt cls
         bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]  # b, max_num_obj, h*w
-        
+
         # (b, max_num_obj, 1, 4), (b, 1, h*w, 4)
         pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
         gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
-        
-        # 1. Standard IoU Calculation
-        overlaps_iou = self.iou_calculation(gt_boxes, pd_boxes)
-        
-        # 2. NWD Calculation for Tiny Objects
-        overlaps_nwd = bbox2nwd(gt_boxes, pd_boxes)
-        
-        # 3. AREA-AWARE HARD SWITCH
-        # Calculate area of ground truth boxes
-        gt_areas = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
-        # Threshold for VisDrone/AI-TOD (e.g., objects smaller than 32x32 pixels)
-        tiny_mask = (gt_areas < 1024.0).float() 
-        
-        # Apply Switch: Pure NWD for tiny, Pure IoU for large
-        final_overlaps = (overlaps_iou * (1.0 - tiny_mask)) + (overlaps_nwd * tiny_mask)
-        overlaps[mask_gt] = final_overlaps
-        
+        overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
+
         align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
         return align_metric, overlaps
 
@@ -459,42 +409,6 @@ def make_anchors(feats, strides, grid_cell_offset=0.5):
         sy, sx = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_11 else torch.meshgrid(sy, sx)
         anchor_points.append(torch.stack((sx, sy), -1).view(-1, 2))
         stride_tensor.append(torch.full((h * w, 1), stride, dtype=dtype, device=device))
-    return torch.cat(anchor_points), torch.cat(stride_tensor)
-
-
-def make_phase_lattice_anchors(feats, strides, slot_offsets):
-    """Generate four phase-aware P3 anchors per cell and standard P4/P5 anchors.
-
-    P3 ordering is slot -> row -> column, matching PhaseLatticeDetect._p3_logits().
-    """
-    assert len(feats) == 3, f"Expected P3-P5 features, received {len(feats)} levels"
-    dtype, device = feats[0].dtype, feats[0].device
-    anchor_points, stride_tensor = [], []
-
-    # P3: four anchors per spatial location
-    h, w = feats[0].shape[2:]
-    sx = torch.arange(end=w, device=device, dtype=dtype)
-    sy = torch.arange(end=h, device=device, dtype=dtype)
-    sy, sx = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_11 else torch.meshgrid(sy, sx)
-
-    base = torch.stack((sx, sy), -1)  # H, W, 2; x/y order
-    offsets = torch.as_tensor(slot_offsets, dtype=dtype, device=device)
-    slot_points = (base.unsqueeze(0) + offsets[:, None, None, :]).reshape(-1, 2)
-
-    anchor_points.append(slot_points)
-    stride_tensor.append(torch.full((slot_points.shape[0], 1), strides[0], dtype=dtype, device=device))
-
-    # Standard P4 and P5 anchors
-    for i in range(1, len(feats)):
-        h, w = feats[i].shape[2:]
-        sx = torch.arange(end=w, device=device, dtype=dtype) + 0.5
-        sy = torch.arange(end=h, device=device, dtype=dtype) + 0.5
-        sy, sx = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_11 else torch.meshgrid(sy, sx)
-
-        points = torch.stack((sx, sy), -1).reshape(-1, 2)
-        anchor_points.append(points)
-        stride_tensor.append(torch.full((h * w, 1), strides[i], dtype=dtype, device=device))
-
     return torch.cat(anchor_points), torch.cat(stride_tensor)
 
 

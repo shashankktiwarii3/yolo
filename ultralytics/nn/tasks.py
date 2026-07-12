@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import HighFreqInject, SemanticFrequencyReassembly, C3k2_MDSA,LCSA
+from ultralytics.nn.modules.block import HighFreqInject
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -512,11 +512,6 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
-    # def init_criterion(self):
-    #     """Initialize the correct detection loss."""
-    #     loss_fn = PhaseLatticeDetectionLoss if isinstance(self.model[-1], PhaseLatticeDetect) else v8DetectionLoss
-    #     return E2ELoss(self, loss_fn) if getattr(self, "end2end", False) else loss_fn(self)
-
 
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
@@ -1589,7 +1584,6 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
-            C3k2_MDSA,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1621,7 +1615,6 @@ def parse_model(d, ch, verbose=True):
             C3TR,
             C3Ghost,
             C3x,
-            C3k2_MDSA,
             RepC3,
             C2fPSA,
             C2fCIB,
@@ -1659,11 +1652,7 @@ def parse_model(d, ch, verbose=True):
         elif m is LCSA:
             c1 = c2 = ch[f]              # channel-preserving
             args = [c1, c2, *args[1:]]
-        # elif m is PhaseLatticeDetect:
-        #     c3, c2_phase, c4, c5 = (ch[x] for x in f)
-        #     c2 = c3  # parser bookkeeping; final layer has no downstream consumer
-        #     args.extend([reg_max, end2end, [c3, c2_phase, c4, c5]])
-        #     m.legacy = legacy
+
         elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
@@ -1676,7 +1665,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m is {C3k2, C3k2_MDSA}:  # for M/L/X sizes
+            if m is C3k2:  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
