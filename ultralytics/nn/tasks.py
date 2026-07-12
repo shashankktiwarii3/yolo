@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import HighFreqInject, SemanticFrequencyReassembly, C3k2_MDSA
+from ultralytics.nn.modules.block import HighFreqInject, SemanticFrequencyReassembly, C3k2_MDSA,LCSA
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1655,6 +1655,10 @@ def parse_model(d, ch, verbose=True):
             c_target, c_source = ch[f[0]], ch[f[1]]
             c2 = c_target
             args = [c_target, c_source, *args]
+
+        elif m in LCSA:
+            c1 = c2 = ch[f]              # channel-preserving
+            args = [c1, c2, *args[1:]] 
         # elif m is PhaseLatticeDetect:
         #     c3, c2_phase, c4, c5 = (ch[x] for x in f)
         #     c2 = c3  # parser bookkeeping; final layer has no downstream consumer
