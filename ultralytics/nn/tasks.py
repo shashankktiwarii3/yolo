@@ -1644,10 +1644,10 @@ def parse_model(d, ch, verbose=True):
             c1 = ch[f[1]]
             c2 = ch[f[0]]
             args = [c1, c2, *args]     # <-- append YAML flags so [use_gate, use_unsharp] flow through
-        elif m is SemanticFrequencyReassembly:
-            c_target, c_source = ch[f[0]], ch[f[1]]
-            c2 = c_target
-            args = [c_target, c_source, *args]
+        # elif m is SemanticFrequencyReassembly:
+        #     c_target, c_source = ch[f[0]], ch[f[1]]
+        #     c2 = c_target
+        #     args = [c_target, c_source, *args]
 
         elif m is LCSA:
             c1 = c2 = ch[f]              # channel-preserving
