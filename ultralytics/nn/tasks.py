@@ -1656,9 +1656,9 @@ def parse_model(d, ch, verbose=True):
             c2 = c_target
             args = [c_target, c_source, *args]
 
-        elif m in LCSA:
+        elif m is LCSA:
             c1 = c2 = ch[f]              # channel-preserving
-            args = [c1, c2, *args[1:]] 
+            args = [c1, c2, *args[1:]]
         # elif m is PhaseLatticeDetect:
         #     c3, c2_phase, c4, c5 = (ch[x] for x in f)
         #     c2 = c3  # parser bookkeeping; final layer has no downstream consumer
