@@ -188,24 +188,23 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # --- AREA-AWARE NWD/IOU LOSS BLOCK ---
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        base_loss_iou = 1.0 - iou
         
-        # --- INJECT NWD LOSS FOR TINY OBJECTS ---
-        loss_nwd = nwd_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])
+        loss_nwd = nwd_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask]).unsqueeze(-1)
         
-        # Calculate areas to identify tiny objects (threshold ~ 32x32 pixels)
+        # Calculate areas to identify tiny objects
         box_areas = (target_bboxes[fg_mask, 2] - target_bboxes[fg_mask, 0]) * (target_bboxes[fg_mask, 3] - target_bboxes[fg_mask, 1])
         tiny_mask = (box_areas < 1024.0).float().unsqueeze(-1)
         
-        # Base IoU loss
-        base_loss_iou = 1.0 - iou
-        
-        # Blend losses: Use NWD for tiny objects, CIoU for large objects
-        blended_loss = (base_loss_iou * (1 - tiny_mask)) + (loss_nwd * tiny_mask)
-        
+        # Hard Switch: CIoU for large, NWD for tiny
+        blended_loss = (base_loss_iou * (1.0 - tiny_mask)) + (loss_nwd * tiny_mask)
         loss_iou = (blended_loss * weight).sum() / target_scores_sum
-        
-        # DFL loss
+        # -------------------------------------
+
+        # DFL loss (Unchanged: Naturally handles reg_max=1 via the else block)
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
             loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
@@ -223,6 +222,7 @@ class BboxLoss(nn.Module):
                 F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
             )
             loss_dfl = loss_dfl.sum() / target_scores_sum
+            
         return loss_iou, loss_dfl
 
 class RLELoss(nn.Module):
@@ -1244,7 +1244,7 @@ class E2ELoss:
         cls_one2one = one2one["scores"]
         
         # Get soft targets from the one2many (teacher) head
-        p_teacher = torch.sigmoid(cls_one2many)
+        p_teacher = torch.sigmoid(cls_one2many.detach())
         
         # Identify dense regions where teacher is confident (max class prob > 0.5)
         density_mask = (p_teacher.max(dim=1)[0] > 0.5).float().unsqueeze(1)

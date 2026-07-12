@@ -11,10 +11,7 @@ from .ops import xywh2xyxy, xywhr2xyxyxyxy, xyxy2xywh
 from .torch_utils import TORCH_1_11
 
 def bbox2nwd(box1, box2, constant=12.0, eps=1e-7):
-    """
-    Calculates Normalized Gaussian Wasserstein Distance (NWD) for bounding boxes.
-    box1, box2 format: [x1, y1, x2, y2]
-    """
+    """Calculates Normalized Gaussian Wasserstein Distance (NWD). Boxes in xyxy format."""
     x1, y1, x2, y2 = box1.unbind(-1)
     cx1, cy1, w1, h1 = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
     
@@ -228,20 +225,31 @@ class TaskAlignedAssigner(nn.Module):
         ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
         ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
         ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
+        
         # Get the scores of each grid for each gt cls
         bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]  # b, max_num_obj, h*w
+        
         # (b, max_num_obj, 1, 4), (b, 1, h*w, 4)
         pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
         gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
-        overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
         
-        # --- INJECT NWD METRIC FOR TINY OBJECTS ---
-        nwd_scores = bbox2nwd(gt_boxes, pd_boxes)
-        # Blend IoU and NWD: 50% IoU, 50% NWD to rescue tiny objects with 0 IoU
-        hybrid_metric = 0.5 * overlaps + 0.5 * nwd_scores
+        # 1. Standard IoU Calculation
+        overlaps_iou = self.iou_calculation(gt_boxes, pd_boxes)
         
-        # Use hybrid_metric for alignment instead of pure overlaps
-        align_metric = bbox_scores.pow(self.alpha) * hybrid_metric.pow(self.beta)
+        # 2. NWD Calculation for Tiny Objects
+        overlaps_nwd = bbox2nwd(gt_boxes, pd_boxes)
+        
+        # 3. AREA-AWARE HARD SWITCH
+        # Calculate area of ground truth boxes
+        gt_areas = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
+        # Threshold for VisDrone/AI-TOD (e.g., objects smaller than 32x32 pixels)
+        tiny_mask = (gt_areas < 1024.0).float() 
+        
+        # Apply Switch: Pure NWD for tiny, Pure IoU for large
+        final_overlaps = (overlaps_iou * (1.0 - tiny_mask)) + (overlaps_nwd * tiny_mask)
+        overlaps[mask_gt] = final_overlaps
+        
+        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
         return align_metric, overlaps
 
     def iou_calculation(self, gt_bboxes, pd_bboxes):
