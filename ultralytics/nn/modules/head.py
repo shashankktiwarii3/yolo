@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
-from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors, make_phase_lattice_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
@@ -791,6 +791,208 @@ class Detect(nn.Module):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
 
+
+class PhaseLatticeDetect(Detect):
+    """YOLO26 detector with four phase-aware P3 candidates per spatial location.
+
+    Input ordering: [P3, P2, P4, P5].
+    P2 is an auxiliary phase source, not a P2 detection level.
+    """
+
+    max_det = 1000
+    slot_offsets = (
+        (0.25, 0.25),
+        (0.75, 0.25),
+        (0.25, 0.75),
+        (0.75, 0.75),
+    )
+
+    def __init__(self, nc: int = 80, reg_max: int = 16, end2end: bool = False, ch: tuple = ()):
+        if len(ch) != 4:
+            raise ValueError(f"PhaseLatticeDetect expects (P3, P2, P4, P5), got {ch}")
+
+        c3, c2_phase, c4, c5 = ch
+        super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=(c3, c4, c5))
+
+        self.p2_channels = c2_phase
+        self.slot_count = len(self.slot_offsets)
+        self.unshuffle = nn.PixelUnshuffle(2)
+
+        # Keep YOLO26's P3 semantic trunks. Only condition the final predictions by P2 phase.
+        c_box = self.cv2[0][-1].in_channels
+        c_cls = self.cv3[0][-1].in_channels
+
+        self.phase_box = Conv(c2_phase, c_box, 1, act=False)
+        self.phase_cls = Conv(c2_phase, c_cls, 1, act=False)
+
+        self.phase_box_scale = nn.Parameter(torch.full((1, 1, c_box, 1, 1), 0.1))
+        self.phase_cls_scale = nn.Parameter(torch.full((1, 1, c_cls, 1, 1), 0.1))
+
+        # Lets the four slots specialize while starting from a stable symmetric initialization.
+        self.slot_box_embed = nn.Parameter(torch.zeros(1, self.slot_count, c_box, 1, 1))
+        self.slot_cls_embed = nn.Parameter(torch.zeros(1, self.slot_count, c_cls, 1, 1))
+
+        if end2end:
+            self.one2one_phase_box = copy.deepcopy(self.phase_box)
+            self.one2one_phase_cls = copy.deepcopy(self.phase_cls)
+
+            self.one2one_phase_box_scale = nn.Parameter(self.phase_box_scale.detach().clone())
+            self.one2one_phase_cls_scale = nn.Parameter(self.phase_cls_scale.detach().clone())
+
+            self.one2one_slot_box_embed = nn.Parameter(self.slot_box_embed.detach().clone())
+            self.one2one_slot_cls_embed = nn.Parameter(self.slot_cls_embed.detach().clone())
+
+    @property
+    def one2many(self):
+        return dict(
+            box_head=self.cv2,
+            cls_head=self.cv3,
+            phase_box=self.phase_box,
+            phase_cls=self.phase_cls,
+            phase_box_scale=self.phase_box_scale,
+            phase_cls_scale=self.phase_cls_scale,
+            slot_box_embed=self.slot_box_embed,
+            slot_cls_embed=self.slot_cls_embed,
+        )
+
+    @property
+    def one2one(self):
+        return dict(
+            box_head=self.one2one_cv2,
+            cls_head=self.one2one_cv3,
+            phase_box=self.one2one_phase_box,
+            phase_cls=self.one2one_phase_cls,
+            phase_box_scale=self.one2one_phase_box_scale,
+            phase_cls_scale=self.one2one_phase_cls_scale,
+            slot_box_embed=self.one2one_slot_box_embed,
+            slot_cls_embed=self.one2one_slot_cls_embed,
+        )
+
+    def _phase_tokens(self, p2: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
+        """Return B*4 phase tensors in slot order:
+        TL, TR, BL, BR.
+        """
+        h, w = target_hw
+
+        if p2.shape[-2:] != (2 * h, 2 * w):
+            p2 = F.interpolate(p2, size=(2 * h, 2 * w), mode="bilinear", align_corners=False)
+
+        b = p2.shape[0]
+        phase = self.unshuffle(p2).view(b, self.p2_channels, self.slot_count, h, w)
+        return phase.permute(0, 2, 1, 3, 4).reshape(b * self.slot_count, self.p2_channels, h, w)
+
+    def _p3_logits(
+        self,
+        p3: torch.Tensor,
+        p2: torch.Tensor,
+        box_head: nn.Sequential,
+        cls_head: nn.Sequential,
+        phase_box: nn.Module,
+        phase_cls: nn.Module,
+        phase_box_scale: torch.Tensor,
+        phase_cls_scale: torch.Tensor,
+        slot_box_embed: torch.Tensor,
+        slot_cls_embed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Create four phase-conditioned P3 predictions per P3 location."""
+        b, _, h, w = p3.shape
+        tokens = self._phase_tokens(p2, (h, w))
+
+        # Shared P3 semantic trunks
+        box_base = box_head[:-1](p3).unsqueeze(1)
+        cls_base = cls_head[:-1](p3).unsqueeze(1)
+
+        # Lightweight P2 phase refinement
+        box_phase = phase_box(tokens).view(b, self.slot_count, -1, h, w)
+        cls_phase = phase_cls(tokens).view(b, self.slot_count, -1, h, w)
+
+        box_features = box_base + phase_box_scale * box_phase + slot_box_embed
+        cls_features = cls_base + phase_cls_scale * cls_phase + slot_cls_embed
+
+        boxes = box_head[-1](box_features.flatten(0, 1))
+        scores = cls_head[-1](cls_features.flatten(0, 1))
+
+        # Flatten in slot -> H -> W order, matching make_phase_lattice_anchors().
+        boxes = boxes.view(b, self.slot_count, 4 * self.reg_max, h, w)
+        boxes = boxes.permute(0, 2, 1, 3, 4).reshape(b, 4 * self.reg_max, -1)
+
+        scores = scores.view(b, self.slot_count, self.nc, h, w)
+        scores = scores.permute(0, 2, 1, 3, 4).reshape(b, self.nc, -1)
+
+        return boxes, scores
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: nn.ModuleList = None,
+        cls_head: nn.ModuleList = None,
+        phase_box: nn.Module = None,
+        phase_cls: nn.Module = None,
+        phase_box_scale: torch.Tensor = None,
+        phase_cls_scale: torch.Tensor = None,
+        slot_box_embed: torch.Tensor = None,
+        slot_cls_embed: torch.Tensor = None,
+    ) -> dict[str, torch.Tensor]:
+        if box_head is None or cls_head is None:
+            return dict()
+
+        p3, p2, p4, p5 = x
+        bs = p3.shape[0]
+
+        p3_boxes, p3_scores = self._p3_logits(
+            p3,
+            p2,
+            box_head[0],
+            cls_head[0],
+            phase_box,
+            phase_cls,
+            phase_box_scale,
+            phase_cls_scale,
+            slot_box_embed,
+            slot_cls_embed,
+        )
+
+        boxes = [p3_boxes]
+        scores = [p3_scores]
+
+        for i, feature in enumerate((p4, p5), start=1):
+            boxes.append(box_head[i](feature).view(bs, 4 * self.reg_max, -1))
+            scores.append(cls_head[i](feature).view(bs, self.nc, -1))
+
+        # Loss still sees three scales: P3, P4, P5.
+        return dict(
+            boxes=torch.cat(boxes, dim=-1),
+            scores=torch.cat(scores, dim=-1),
+            feats=[p3, p4, p5],
+        )
+
+    def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode P3 using the four phase offsets."""
+        shape = tuple(feature.shape for feature in x["feats"])
+
+        if self.dynamic or self.shape != shape:
+            anchors, strides = make_phase_lattice_anchors(x["feats"], self.stride, self.slot_offsets)
+            self.anchors, self.strides = anchors.transpose(0, 1), strides.transpose(0, 1)
+            self.shape = shape
+
+        return self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
+
+    def bias_init(self):
+        """Initialize class priors while accounting for four P3 slots."""
+        for i, (box_head, cls_head) in enumerate(zip(self.cv2, self.cv3)):
+            box_head[-1].bias.data[:] = 2.0
+            slots = self.slot_count if i == 0 else 1
+            cls_head[-1].bias.data[: self.nc] = math.log(
+                5 / self.nc / (640 / self.stride[i]) ** 2 / slots
+            )
+
+        if self.end2end:
+            for i, (box_head, cls_head) in enumerate(zip(self.one2one_cv2, self.one2one_cv3)):
+                box_head[-1].bias.data[:] = 2.0
+                slots = self.slot_count if i == 0 else 1
+                cls_head[-1].bias.data[: self.nc] = math.log(
+                    5 / self.nc / (640 / self.stride[i]) ** 2 / slots
+                )
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.

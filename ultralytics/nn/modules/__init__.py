@@ -81,6 +81,7 @@ from .head import (
     OBB26,
     Classify,
     Detect,
+    PhaseLatticeDetect,
     LRPCHead,
     Pose,
     Pose26,
@@ -187,4 +188,5 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "PhaseLatticeDetect"
 )

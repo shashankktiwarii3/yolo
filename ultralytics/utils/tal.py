@@ -412,6 +412,42 @@ def make_anchors(feats, strides, grid_cell_offset=0.5):
     return torch.cat(anchor_points), torch.cat(stride_tensor)
 
 
+def make_phase_lattice_anchors(feats, strides, slot_offsets):
+    """Generate four phase-aware P3 anchors per cell and standard P4/P5 anchors.
+
+    P3 ordering is slot -> row -> column, matching PhaseLatticeDetect._p3_logits().
+    """
+    assert len(feats) == 3, f"Expected P3-P5 features, received {len(feats)} levels"
+    dtype, device = feats[0].dtype, feats[0].device
+    anchor_points, stride_tensor = [], []
+
+    # P3: four anchors per spatial location
+    h, w = feats[0].shape[2:]
+    sx = torch.arange(end=w, device=device, dtype=dtype)
+    sy = torch.arange(end=h, device=device, dtype=dtype)
+    sy, sx = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_11 else torch.meshgrid(sy, sx)
+
+    base = torch.stack((sx, sy), -1)  # H, W, 2; x/y order
+    offsets = torch.as_tensor(slot_offsets, dtype=dtype, device=device)
+    slot_points = (base.unsqueeze(0) + offsets[:, None, None, :]).reshape(-1, 2)
+
+    anchor_points.append(slot_points)
+    stride_tensor.append(torch.full((slot_points.shape[0], 1), strides[0], dtype=dtype, device=device))
+
+    # Standard P4 and P5 anchors
+    for i in range(1, len(feats)):
+        h, w = feats[i].shape[2:]
+        sx = torch.arange(end=w, device=device, dtype=dtype) + 0.5
+        sy = torch.arange(end=h, device=device, dtype=dtype) + 0.5
+        sy, sx = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_11 else torch.meshgrid(sy, sx)
+
+        points = torch.stack((sx, sy), -1).reshape(-1, 2)
+        anchor_points.append(points)
+        stride_tensor.append(torch.full((h * w, 1), strides[i], dtype=dtype, device=device))
+
+    return torch.cat(anchor_points), torch.cat(stride_tensor)
+
+
 def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
     """Transform distance(ltrb) to box(xywh or xyxy)."""
     lt, rb = distance.chunk(2, dim)
