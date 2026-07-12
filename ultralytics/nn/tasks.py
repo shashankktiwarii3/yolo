@@ -47,7 +47,6 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
-    PhaseLatticeDetect,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -80,7 +79,6 @@ from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2ELoss,
-    #PhaseLatticeDetectionLoss,
     PoseLoss26,
     v8ClassificationLoss,
     v8DetectionLoss,
@@ -1655,11 +1653,11 @@ def parse_model(d, ch, verbose=True):
             c_target, c_source = ch[f[0]], ch[f[1]]
             c2 = c_target
             args = [c_target, c_source, *args]
-        elif m is PhaseLatticeDetect:
-            c3, c2_phase, c4, c5 = (ch[x] for x in f)
-            c2 = c3  # parser bookkeeping; final layer has no downstream consumer
-            args.extend([reg_max, end2end, [c3, c2_phase, c4, c5]])
-            m.legacy = legacy
+        # elif m is PhaseLatticeDetect:
+        #     c3, c2_phase, c4, c5 = (ch[x] for x in f)
+        #     c2 = c3  # parser bookkeeping; final layer has no downstream consumer
+        #     args.extend([reg_max, end2end, [c3, c2_phase, c4, c5]])
+        #     m.legacy = legacy
         elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
