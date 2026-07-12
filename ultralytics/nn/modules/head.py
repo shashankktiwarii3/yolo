@@ -92,6 +92,110 @@ class TanhRefine(nn.Module):
             outs.append(torch.tanh(r) * self.scale.view(1, -1, 1))
         return torch.cat(outs, dim=-1)                            # (bs, 4rm, sum HW)
 
+# tiny_refine_head.py
+# Refinement Detect head for Ultralytics YOLO26 (DFL-free, NMS-free / end2end)
+# for tiny-object datasets (VisDrone, AI-TOD). AMP-safe, export-friendly.
+
+import copy
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ultralytics.nn.modules.conv import Conv
+from ultralytics.nn.modules.head import Detect
+
+
+class BoxPointSampler(nn.Module):
+    """Box-guided key-point feature sampler.
+
+    Given coarse per-anchor ltrb distances (in grid units of the level, same space
+    the stock head regresses in), samples a reduced feature map at:
+      - 9 box points: center, 4 corners, 4 edge midpoints
+      - 8 context-ring points at ctx_scale x the box extent (optional)
+    via a single grid_sample call, then fuses to a compact refinement embedding.
+
+    AMP notes: all grids are created in the feature dtype/device; grid_sample with
+    fp16 is supported on CUDA; padding_mode='border' keeps edge-of-image boxes sane.
+    """
+
+    def __init__(self, c_in: int, c_mid: int = 32, c_out: int = 64,
+                 min_extent: float = 1.0, ctx_scale: float = 2.0):
+        super().__init__()
+        self.min_extent = float(min_extent)  # floor (cells): sub-cell boxes still reach neighbors
+        self.ctx_scale = float(ctx_scale)    # 0.0 disables the context ring
+        self.np = 9 + (8 if self.ctx_scale else 0)
+        self.reduce = Conv(c_in, c_mid, 1)
+        self.fuse = Conv(self.np * c_mid, c_out, 1)
+
+    def forward(self, feat: torch.Tensor, ltrb: torch.Tensor) -> torch.Tensor:
+        bs, _, h, w = feat.shape
+        dt, dev = feat.dtype, feat.device
+        red = self.reduce(feat)  # (bs, c_mid, h, w)
+
+        # Anchor centers in grid units — matches make_anchors(grid_cell_offset=0.5)
+        gy, gx = torch.meshgrid(
+            torch.arange(h, device=dev, dtype=dt) + 0.5,
+            torch.arange(w, device=dev, dtype=dt) + 0.5,
+            indexing="ij",
+        )
+
+        # Geometry only: detach (Deformable-DETR-style stable refinement),
+        # clamp negatives, floor tiny extents so sampling reaches neighboring cells.
+        d = ltrb.detach().clamp_min(0)
+        l = d[:, 0].clamp_min(self.min_extent)
+        t = d[:, 1].clamp_min(self.min_extent)
+        r = d[:, 2].clamp_min(self.min_extent)
+        b = d[:, 3].clamp_min(self.min_extent)
+
+        x1, x2 = gx - l, gx + r          # (bs, h, w), broadcast over the base grid
+        y1, y2 = gy - t, gy + b
+        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+        pts = [(cx, cy),
+               (x1, y1), (cx, y1), (x2, y1),
+               (x1, cy),           (x2, cy),
+               (x1, y2), (cx, y2), (x2, y2)]
+        if self.ctx_scale:
+            s = self.ctx_scale           # context ring centered on the box center
+            X1, X2 = cx - l * s, cx + r * s
+            Y1, Y2 = cy - t * s, cy + b * s
+            pts += [(X1, Y1), (cx, Y1), (X2, Y1),
+                    (X1, cy),           (X2, cy),
+                    (X1, Y2), (cx, Y2), (X2, Y2)]
+
+        # Normalize to [-1, 1] for align_corners=False: u = 2*x/W - 1
+        u = torch.stack([p[0] for p in pts], 1) * (2.0 / w) - 1.0   # (bs, P, h, w)
+        v = torch.stack([p[1] for p in pts], 1) * (2.0 / h) - 1.0
+        grid = torch.stack((u, v), -1).view(bs, self.np * h, w, 2)
+
+        smp = F.grid_sample(red, grid.to(red.dtype), mode="bilinear",
+                            padding_mode="border", align_corners=False)   # (bs, c_mid, P*h, w)
+        smp = smp.view(bs, -1, self.np, h, w).transpose(1, 2).reshape(bs, self.np * red.shape[1], h, w)
+        return self.fuse(smp)  # (bs, c_out, h, w)
+
+
+class TinyRefine(nn.Module):
+    """Residual box delta (grid units) + quality/objectness logit from box-guided samples.
+
+    Zero-initialized output convs => the refined head is an exact identity of the
+    stock YOLO26 head at initialization (safe warm-start from COCO weights, and no
+    early-training fp16 range issues under AMP).
+    """
+
+    def __init__(self, c_in: int, c_mid: int = 32, c_out: int = 64,
+                 min_extent: float = 1.0, ctx_scale: float = 2.0):
+        super().__init__()
+        self.sampler = BoxPointSampler(c_in, c_mid, c_out, min_extent, ctx_scale)
+        self.delta = nn.Conv2d(c_out, 4, 1)     # residual ltrb
+        self.quality = nn.Conv2d(c_out, 1, 1)   # objectness-like logit, broadcast to all classes
+        for m in (self.delta, self.quality):
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, feat: torch.Tensor, coarse_ltrb: torch.Tensor):
+        z = self.sampler(feat, coarse_ltrb)
+        return self.delta(z), self.quality(z)
 
 
 
@@ -186,242 +290,242 @@ class CellRefine(nn.Module):
                 outs.append(torch.zeros(bs, 4, h * w, device=feats[i].device))
         
         return torch.cat(outs, dim=-1)
-class Detect(nn.Module):
-    """YOLO Detect head for object detection models.
+# class Detect(nn.Module):
+#     """YOLO Detect head for object detection models.
 
-    This class implements the detection head used in YOLO models for predicting bounding boxes and class probabilities.
-    It supports both training and inference modes, with optional end-to-end detection capabilities.
+#     This class implements the detection head used in YOLO models for predicting bounding boxes and class probabilities.
+#     It supports both training and inference modes, with optional end-to-end detection capabilities.
 
-    Attributes:
-        dynamic (bool): Force grid reconstruction.
-        export (bool): Export mode flag.
-        format (str): Export format.
-        end2end (bool): End-to-end detection mode.
-        max_det (int): Maximum detections per image.
-        shape (tuple): Input shape.
-        anchors (torch.Tensor): Anchor points.
-        strides (torch.Tensor): Feature map strides.
-        legacy (bool): Backward compatibility for v3/v5/v8/v9 models.
-        xyxy (bool): Output format, xyxy or xywh.
-        nc (int): Number of classes.
-        nl (int): Number of detection layers.
-        reg_max (int): DFL channels.
-        no (int): Number of outputs per anchor.
-        stride (torch.Tensor): Strides computed during build.
-        cv2 (nn.ModuleList): Convolution layers for box regression.
-        cv3 (nn.ModuleList): Convolution layers for classification.
-        dfl (nn.Module): Distribution Focal Loss layer.
-        one2one_cv2 (nn.ModuleList): One-to-one convolution layers for box regression.
-        one2one_cv3 (nn.ModuleList): One-to-one convolution layers for classification.
+#     Attributes:
+#         dynamic (bool): Force grid reconstruction.
+#         export (bool): Export mode flag.
+#         format (str): Export format.
+#         end2end (bool): End-to-end detection mode.
+#         max_det (int): Maximum detections per image.
+#         shape (tuple): Input shape.
+#         anchors (torch.Tensor): Anchor points.
+#         strides (torch.Tensor): Feature map strides.
+#         legacy (bool): Backward compatibility for v3/v5/v8/v9 models.
+#         xyxy (bool): Output format, xyxy or xywh.
+#         nc (int): Number of classes.
+#         nl (int): Number of detection layers.
+#         reg_max (int): DFL channels.
+#         no (int): Number of outputs per anchor.
+#         stride (torch.Tensor): Strides computed during build.
+#         cv2 (nn.ModuleList): Convolution layers for box regression.
+#         cv3 (nn.ModuleList): Convolution layers for classification.
+#         dfl (nn.Module): Distribution Focal Loss layer.
+#         one2one_cv2 (nn.ModuleList): One-to-one convolution layers for box regression.
+#         one2one_cv3 (nn.ModuleList): One-to-one convolution layers for classification.
 
-    Methods:
-        forward: Perform forward pass and return predictions.
-        forward_end2end: Perform forward pass for end-to-end detection.
-        bias_init: Initialize detection head biases.
-        decode_bboxes: Decode bounding boxes from predictions.
-        postprocess: Post-process model predictions.
+#     Methods:
+#         forward: Perform forward pass and return predictions.
+#         forward_end2end: Perform forward pass for end-to-end detection.
+#         bias_init: Initialize detection head biases.
+#         decode_bboxes: Decode bounding boxes from predictions.
+#         postprocess: Post-process model predictions.
 
-    Examples:
-        Create a detection head for 80 classes
-        >>> detect = Detect(nc=80, ch=(256, 512, 1024))
-        >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
-        >>> outputs = detect(x)
-    """
+#     Examples:
+#         Create a detection head for 80 classes
+#         >>> detect = Detect(nc=80, ch=(256, 512, 1024))
+#         >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
+#         >>> outputs = detect(x)
+#     """
 
-    dynamic = False  # force grid reconstruction
-    export = False  # export mode
-    format = None  # export format
-    max_det = 300  # max_det
-    agnostic_nms = False
-    shape = None
-    anchors = torch.empty(0)  # init
-    strides = torch.empty(0)  # init
-    legacy = False  # backward compatibility for v3/v5/v8/v9 models
-    xyxy = False  # xyxy or xywh output
+#     dynamic = False  # force grid reconstruction
+#     export = False  # export mode
+#     format = None  # export format
+#     max_det = 300  # max_det
+#     agnostic_nms = False
+#     shape = None
+#     anchors = torch.empty(0)  # init
+#     strides = torch.empty(0)  # init
+#     legacy = False  # backward compatibility for v3/v5/v8/v9 models
+#     xyxy = False  # xyxy or xywh output
 
-    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
-        """Initialize the YOLO detection layer with specified number of classes and channels.
+#     def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+#         """Initialize the YOLO detection layer with specified number of classes and channels.
 
-        Args:
-            nc (int): Number of classes.
-            reg_max (int): Maximum number of DFL channels.
-            end2end (bool): Whether to use end-to-end NMS-free detection.
-            ch (tuple): Tuple of channel sizes from backbone feature maps.
-        """
-        super().__init__()
-        self.nc = nc  # number of classes
-        self.nl = len(ch)  # number of detection layers
-        self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
-        self.no = nc + self.reg_max * 4  # number of outputs per anchor
-        self.stride = torch.zeros(self.nl)  # strides computed during build
-        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
-        self.cv2 = nn.ModuleList(
-            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
-        )
-        self.cv3 = (
-            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
-            if self.legacy
-            else nn.ModuleList(
-                nn.Sequential(
-                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
-                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                    nn.Conv2d(c3, self.nc, 1),
-                )
-                for x in ch
-            )
-        )
-        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
-        self.refine = CellRefine(ch)
+#         Args:
+#             nc (int): Number of classes.
+#             reg_max (int): Maximum number of DFL channels.
+#             end2end (bool): Whether to use end-to-end NMS-free detection.
+#             ch (tuple): Tuple of channel sizes from backbone feature maps.
+#         """
+#         super().__init__()
+#         self.nc = nc  # number of classes
+#         self.nl = len(ch)  # number of detection layers
+#         self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
+#         self.no = nc + self.reg_max * 4  # number of outputs per anchor
+#         self.stride = torch.zeros(self.nl)  # strides computed during build
+#         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+#         self.cv2 = nn.ModuleList(
+#             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+#         )
+#         self.cv3 = (
+#             nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+#             if self.legacy
+#             else nn.ModuleList(
+#                 nn.Sequential(
+#                     nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+#                     nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+#                     nn.Conv2d(c3, self.nc, 1),
+#                 )
+#                 for x in ch
+#             )
+#         )
+#         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+#         self.refine = CellRefine(ch)
 
-        if end2end:
-            self.one2one_cv2 = copy.deepcopy(self.cv2)
-            self.one2one_cv3 = copy.deepcopy(self.cv3)
-            self.one2one_refine = copy.deepcopy(self.refine)
+#         if end2end:
+#             self.one2one_cv2 = copy.deepcopy(self.cv2)
+#             self.one2one_cv3 = copy.deepcopy(self.cv3)
+#             self.one2one_refine = copy.deepcopy(self.refine)
 
-    @property
-    def one2many(self):
-        # --- MODIFY THIS LINE ---
-        return dict(box_head=self.cv2, cls_head=self.cv3, refine_head=self.refine)
+#     @property
+#     def one2many(self):
+#         # --- MODIFY THIS LINE ---
+#         return dict(box_head=self.cv2, cls_head=self.cv3, refine_head=self.refine)
 
-    @property
-    def one2one(self):
-        # --- MODIFY THIS LINE ---
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, refine_head=self.one2one_refine)
+#     @property
+#     def one2one(self):
+#         # --- MODIFY THIS LINE ---
+#         return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, refine_head=self.one2one_refine)
 
-    @property
-    def end2end(self):
-        """Checks if the model has one2one for v5/v5/v8/v9/11 backward compatibility."""
-        return getattr(self, "_end2end", True) and hasattr(self, "one2one")
+#     @property
+#     def end2end(self):
+#         """Checks if the model has one2one for v5/v5/v8/v9/11 backward compatibility."""
+#         return getattr(self, "_end2end", True) and hasattr(self, "one2one")
 
-    @end2end.setter
-    def end2end(self, value):
-        """Override the end-to-end detection mode."""
-        self._end2end = value
+#     @end2end.setter
+#     def end2end(self, value):
+#         """Override the end-to-end detection mode."""
+#         self._end2end = value
 
-    def forward_head(
-        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None, refine_head: torch.nn.Module = None
-    ) -> dict[str, torch.Tensor]:
-        if box_head is None or cls_head is None:
-            return dict()
-        bs = x[0].shape[0]
-        boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+#     def forward_head(
+#         self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None, refine_head: torch.nn.Module = None
+#     ) -> dict[str, torch.Tensor]:
+#         if box_head is None or cls_head is None:
+#             return dict()
+#         bs = x[0].shape[0]
+#         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
         
-        # --- ADD THIS BLOCK ---
-        if refine_head is not None:
-            # Add the refine deltas directly to the raw distances (cell units)
-            boxes = boxes + refine_head(x)
-        # ----------------------
+#         # --- ADD THIS BLOCK ---
+#         if refine_head is not None:
+#             # Add the refine deltas directly to the raw distances (cell units)
+#             boxes = boxes + refine_head(x)
+#         # ----------------------
 
-        scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
-        return dict(boxes=boxes, scores=scores, feats=x)
+#         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+#         return dict(boxes=boxes, scores=scores, feats=x)
 
-    def forward(
-        self, x: list[torch.Tensor]
-    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Concatenates and returns predicted bounding boxes and class probabilities."""
-        preds = self.forward_head(x, **self.one2many)
-        if self.end2end:
-            x_detach = [xi.detach() for xi in x]
-            one2one = self.forward_head(x_detach, **self.one2one)
-            preds = {"one2many": preds, "one2one": one2one}
-        if self.training:
-            return preds
-        y = self._inference(preds["one2one"] if self.end2end else preds)
-        if self.end2end:
-            y = self.postprocess(y.permute(0, 2, 1))
-        return y if self.export else (y, preds)
+#     def forward(
+#         self, x: list[torch.Tensor]
+#     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+#         """Concatenates and returns predicted bounding boxes and class probabilities."""
+#         preds = self.forward_head(x, **self.one2many)
+#         if self.end2end:
+#             x_detach = [xi.detach() for xi in x]
+#             one2one = self.forward_head(x_detach, **self.one2one)
+#             preds = {"one2many": preds, "one2one": one2one}
+#         if self.training:
+#             return preds
+#         y = self._inference(preds["one2one"] if self.end2end else preds)
+#         if self.end2end:
+#             y = self.postprocess(y.permute(0, 2, 1))
+#         return y if self.export else (y, preds)
 
-    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
+#     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+#         """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
 
-        Args:
-            x (dict[str, torch.Tensor]): List of feature maps from different detection layers.
+#         Args:
+#             x (dict[str, torch.Tensor]): List of feature maps from different detection layers.
 
-        Returns:
-            (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
-        """
-        # Inference path
-        dbox = self._get_decode_boxes(x)
-        return torch.cat((dbox, x["scores"].sigmoid()), 1)
+#         Returns:
+#             (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
+#         """
+#         # Inference path
+#         dbox = self._get_decode_boxes(x)
+#         return torch.cat((dbox, x["scores"].sigmoid()), 1)
 
-    def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get decoded boxes based on anchors and strides."""
-        shape = x["feats"][0].shape  # BCHW
-        if self.dynamic or self.shape != shape:
-            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
-            self.shape = shape
+#     def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+#         """Get decoded boxes based on anchors and strides."""
+#         shape = x["feats"][0].shape  # BCHW
+#         if self.dynamic or self.shape != shape:
+#             self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
+#             self.shape = shape
 
-        dbox = self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
-        return dbox
+#         dbox = self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
+#         return dbox
 
-    def bias_init(self):
-        """Initialize Detect() biases, WARNING: requires stride availability."""
-        for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):  # from
-            a[-1].bias.data[:] = 2.0  # box
-            b[-1].bias.data[: self.nc] = math.log(
-                5 / self.nc / (640 / self.stride[i]) ** 2
-            )  # cls (.01 objects, 80 classes, 640 img)
-        if self.end2end:
-            for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
-                a[-1].bias.data[:] = 2.0  # box
-                b[-1].bias.data[: self.nc] = math.log(
-                    5 / self.nc / (640 / self.stride[i]) ** 2
-                )  # cls (.01 objects, 80 classes, 640 img)
+#     def bias_init(self):
+#         """Initialize Detect() biases, WARNING: requires stride availability."""
+#         for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):  # from
+#             a[-1].bias.data[:] = 2.0  # box
+#             b[-1].bias.data[: self.nc] = math.log(
+#                 5 / self.nc / (640 / self.stride[i]) ** 2
+#             )  # cls (.01 objects, 80 classes, 640 img)
+#         if self.end2end:
+#             for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
+#                 a[-1].bias.data[:] = 2.0  # box
+#                 b[-1].bias.data[: self.nc] = math.log(
+#                     5 / self.nc / (640 / self.stride[i]) ** 2
+#                 )  # cls (.01 objects, 80 classes, 640 img)
 
-    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
-        """Decode bounding boxes from predictions."""
-        return dist2bbox(
-            bboxes,
-            anchors,
-            xywh=xywh and not self.end2end and not self.xyxy,
-            dim=1,
-        )
+#     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
+#         """Decode bounding boxes from predictions."""
+#         return dist2bbox(
+#             bboxes,
+#             anchors,
+#             xywh=xywh and not self.end2end and not self.xyxy,
+#             dim=1,
+#         )
 
-    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
-        """Post-processes YOLO model predictions.
+#     def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+#         """Post-processes YOLO model predictions.
 
-        Args:
-            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc) with last dimension
-                format [x, y, w, h, class_probs].
+#         Args:
+#             preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc) with last dimension
+#                 format [x, y, w, h, class_probs].
 
-        Returns:
-            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6) and last
-                dimension format [x, y, w, h, max_class_prob, class_index].
-        """
-        boxes, scores = preds.split([4, self.nc], dim=-1)
-        scores, conf, idx = self.get_topk_index(scores, self.max_det)
-        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
-        return torch.cat([boxes, scores, conf], dim=-1)
+#         Returns:
+#             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6) and last
+#                 dimension format [x, y, w, h, max_class_prob, class_index].
+#         """
+#         boxes, scores = preds.split([4, self.nc], dim=-1)
+#         scores, conf, idx = self.get_topk_index(scores, self.max_det)
+#         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+#         return torch.cat([boxes, scores, conf], dim=-1)
 
-    def get_topk_index(self, scores: torch.Tensor, max_det: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get top-k indices from scores.
+#     def get_topk_index(self, scores: torch.Tensor, max_det: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#         """Get top-k indices from scores.
 
-        Args:
-            scores (torch.Tensor): Scores tensor with shape (batch_size, num_anchors, num_classes).
-            max_det (int): Maximum detections per image.
+#         Args:
+#             scores (torch.Tensor): Scores tensor with shape (batch_size, num_anchors, num_classes).
+#             max_det (int): Maximum detections per image.
 
-        Returns:
-            (torch.Tensor, torch.Tensor, torch.Tensor): Top scores, class indices, and filtered indices.
-        """
-        batch_size, anchors, nc = scores.shape  # i.e. shape(16,8400,84)
-        # Use max_det directly during export for TensorRT compatibility (requires k to be constant),
-        # otherwise use min(max_det, anchors) for safety with small inputs during Python inference
-        k = max_det if self.export else min(max_det, anchors)
-        if self.agnostic_nms:
-            scores, labels = scores.max(dim=-1, keepdim=True)
-            scores, indices = scores.topk(k, dim=1)
-            labels = labels.gather(1, indices)
-            return scores, labels, indices
-        ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
-        scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
-        scores, index = scores.flatten(1).topk(k)
-        idx = ori_index[torch.arange(batch_size)[..., None], index // nc]  # original index
-        return scores[..., None], (index % nc)[..., None].float(), idx
+#         Returns:
+#             (torch.Tensor, torch.Tensor, torch.Tensor): Top scores, class indices, and filtered indices.
+#         """
+#         batch_size, anchors, nc = scores.shape  # i.e. shape(16,8400,84)
+#         # Use max_det directly during export for TensorRT compatibility (requires k to be constant),
+#         # otherwise use min(max_det, anchors) for safety with small inputs during Python inference
+#         k = max_det if self.export else min(max_det, anchors)
+#         if self.agnostic_nms:
+#             scores, labels = scores.max(dim=-1, keepdim=True)
+#             scores, indices = scores.topk(k, dim=1)
+#             labels = labels.gather(1, indices)
+#             return scores, labels, indices
+#         ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
+#         scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
+#         scores, index = scores.flatten(1).topk(k)
+#         idx = ori_index[torch.arange(batch_size)[..., None], index // nc]  # original index
+#         return scores[..., None], (index % nc)[..., None].float(), idx
 
-    def fuse(self) -> None:
-        """Remove the one2many head for inference optimization."""
-        # --- MODIFY THIS LINE ---
-        self.cv2 = self.cv3 = self.refine = None
+#     def fuse(self) -> None:
+#         """Remove the one2many head for inference optimization."""
+#         # --- MODIFY THIS LINE ---
+#         self.cv2 = self.cv3 = self.refine = None
 
 
 
@@ -896,234 +1000,324 @@ class Detect(nn.Module):
 #         self.cv2 = self.cv3 = self.periodic = None
 
 #ORG
-# class Detect(nn.Module):
-#     """YOLO Detect head for object detection models.
+class Detect(nn.Module):
+    """YOLO Detect head for object detection models.
 
-#     This class implements the detection head used in YOLO models for predicting bounding boxes and class probabilities.
-#     It supports both training and inference modes, with optional end-to-end detection capabilities.
+    This class implements the detection head used in YOLO models for predicting bounding boxes and class probabilities.
+    It supports both training and inference modes, with optional end-to-end detection capabilities.
 
-#     Attributes:
-#         dynamic (bool): Force grid reconstruction.
-#         export (bool): Export mode flag.
-#         format (str): Export format.
-#         end2end (bool): End-to-end detection mode.
-#         max_det (int): Maximum detections per image.
-#         shape (tuple): Input shape.
-#         anchors (torch.Tensor): Anchor points.
-#         strides (torch.Tensor): Feature map strides.
-#         legacy (bool): Backward compatibility for v3/v5/v8/v9 models.
-#         xyxy (bool): Output format, xyxy or xywh.
-#         nc (int): Number of classes.
-#         nl (int): Number of detection layers.
-#         reg_max (int): DFL channels.
-#         no (int): Number of outputs per anchor.
-#         stride (torch.Tensor): Strides computed during build.
-#         cv2 (nn.ModuleList): Convolution layers for box regression.
-#         cv3 (nn.ModuleList): Convolution layers for classification.
-#         dfl (nn.Module): Distribution Focal Loss layer.
-#         one2one_cv2 (nn.ModuleList): One-to-one convolution layers for box regression.
-#         one2one_cv3 (nn.ModuleList): One-to-one convolution layers for classification.
+    Attributes:
+        dynamic (bool): Force grid reconstruction.
+        export (bool): Export mode flag.
+        format (str): Export format.
+        end2end (bool): End-to-end detection mode.
+        max_det (int): Maximum detections per image.
+        shape (tuple): Input shape.
+        anchors (torch.Tensor): Anchor points.
+        strides (torch.Tensor): Feature map strides.
+        legacy (bool): Backward compatibility for v3/v5/v8/v9 models.
+        xyxy (bool): Output format, xyxy or xywh.
+        nc (int): Number of classes.
+        nl (int): Number of detection layers.
+        reg_max (int): DFL channels.
+        no (int): Number of outputs per anchor.
+        stride (torch.Tensor): Strides computed during build.
+        cv2 (nn.ModuleList): Convolution layers for box regression.
+        cv3 (nn.ModuleList): Convolution layers for classification.
+        dfl (nn.Module): Distribution Focal Loss layer.
+        one2one_cv2 (nn.ModuleList): One-to-one convolution layers for box regression.
+        one2one_cv3 (nn.ModuleList): One-to-one convolution layers for classification.
 
-#     Methods:
-#         forward: Perform forward pass and return predictions.
-#         forward_end2end: Perform forward pass for end-to-end detection.
-#         bias_init: Initialize detection head biases.
-#         decode_bboxes: Decode bounding boxes from predictions.
-#         postprocess: Post-process model predictions.
+    Methods:
+        forward: Perform forward pass and return predictions.
+        forward_end2end: Perform forward pass for end-to-end detection.
+        bias_init: Initialize detection head biases.
+        decode_bboxes: Decode bounding boxes from predictions.
+        postprocess: Post-process model predictions.
 
-#     Examples:
-#         Create a detection head for 80 classes
-#         >>> detect = Detect(nc=80, ch=(256, 512, 1024))
-#         >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
-#         >>> outputs = detect(x)
-#     """
+    Examples:
+        Create a detection head for 80 classes
+        >>> detect = Detect(nc=80, ch=(256, 512, 1024))
+        >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
+        >>> outputs = detect(x)
+    """
 
-#     dynamic = False  # force grid reconstruction
-#     export = False  # export mode
-#     format = None  # export format
-#     max_det = 300  # max_det
-#     agnostic_nms = False
-#     shape = None
-#     anchors = torch.empty(0)  # init
-#     strides = torch.empty(0)  # init
-#     legacy = False  # backward compatibility for v3/v5/v8/v9 models
-#     xyxy = False  # xyxy or xywh output
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    format = None  # export format
+    max_det = 300  # max_det
+    agnostic_nms = False
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+    legacy = False  # backward compatibility for v3/v5/v8/v9 models
+    xyxy = False  # xyxy or xywh output
+    refine_enable = True
+    refine_cmid = 32
+    refine_cout = 64
+    refine_min_extent = 1.0
+    refine_ctx = 2.0
+    refine_levels = None      # None = all levels; e.g. (0,) = P2/P3 only
 
-#     def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
-#         """Initialize the YOLO detection layer with specified number of classes and channels.
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize the YOLO detection layer with specified number of classes and channels.
 
-#         Args:
-#             nc (int): Number of classes.
-#             reg_max (int): Maximum number of DFL channels.
-#             end2end (bool): Whether to use end-to-end NMS-free detection.
-#             ch (tuple): Tuple of channel sizes from backbone feature maps.
-#         """
-#         super().__init__()
-#         self.nc = nc  # number of classes
-#         self.nl = len(ch)  # number of detection layers
-#         self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
-#         self.no = nc + self.reg_max * 4  # number of outputs per anchor
-#         self.stride = torch.zeros(self.nl)  # strides computed during build
-#         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
-#         self.cv2 = nn.ModuleList(
-#             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
-#         )
-#         self.cv3 = (
-#             nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
-#             if self.legacy
-#             else nn.ModuleList(
-#                 nn.Sequential(
-#                     nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
-#                     nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-#                     nn.Conv2d(c3, self.nc, 1),
-#                 )
-#                 for x in ch
-#             )
-#         )
-#         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+        Args:
+            nc (int): Number of classes.
+            reg_max (int): Maximum number of DFL channels.
+            end2end (bool): Whether to use end-to-end NMS-free detection.
+            ch (tuple): Tuple of channel sizes from backbone feature maps.
+        """
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch)  # number of detection layers
+        self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.cv3 = (
+            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+            if self.legacy
+            else nn.ModuleList(
+                nn.Sequential(
+                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                    nn.Conv2d(c3, self.nc, 1),
+                )
+                for x in ch
+            )
+        )
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
-#         if end2end:
-#             self.one2one_cv2 = copy.deepcopy(self.cv2)
-#             self.one2one_cv3 = copy.deepcopy(self.cv3)
+        # Refinement only for the DFL-free (YOLO26) head; v3/v5/v8/v9/11 (reg_max=16) untouched.
+        if self.refine_enable and self.reg_max == 1:
+            levels = tuple(range(self.nl)) if self.refine_levels is None else tuple(self.refine_levels)
+            self.refine = nn.ModuleDict({
+                str(i): TinyRefine(ch[i], self.refine_cmid, self.refine_cout,
+                                   self.refine_min_extent, self.refine_ctx)
+                for i in levels
+            })
+        else:
+            self.refine = nn.ModuleDict()
 
-#     @property
-#     def one2many(self):
-#         """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
-#         return dict(box_head=self.cv2, cls_head=self.cv3)
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+            self.one2one_refine = copy.deepcopy(self.refine)
 
-#     @property
-#     def one2one(self):
-#         """Returns the one-to-one head components."""
-#         return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
+    @property
+    def one2many(self):
+        """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
+        return dict(box_head=self.cv2, cls_head=self.cv3, refine=getattr(self, "refine", None))
 
-#     @property
-#     def end2end(self):
-#         """Checks if the model has one2one for v5/v5/v8/v9/11 backward compatibility."""
-#         return getattr(self, "_end2end", True) and hasattr(self, "one2one")
+    @property
+    def one2one(self):
+        """Returns the one-to-one head components."""
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3,
+                    refine=getattr(self, "one2one_refine", None))
 
-#     @end2end.setter
-#     def end2end(self, value):
-#         """Override the end-to-end detection mode."""
-#         self._end2end = value
+    @property
+    def end2end(self):
+        """Checks if the model has one2one for v5/v5/v8/v9/11 backward compatibility."""
+        return getattr(self, "_end2end", True) and hasattr(self, "one2one")
 
-#     def forward_head(
-#         self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
-#     ) -> dict[str, torch.Tensor]:
-#         """Concatenates and returns predicted bounding boxes and class probabilities."""
-#         if box_head is None or cls_head is None:  # for fused inference
-#             return dict()
-#         bs = x[0].shape[0]  # batch size
-#         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
-#         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
-#         return dict(boxes=boxes, scores=scores, feats=x)
+    @end2end.setter
+    def end2end(self, value):
+        """Override the end-to-end detection mode."""
+        self._end2end = value
 
-#     def forward(
-#         self, x: list[torch.Tensor]
-#     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-#         """Concatenates and returns predicted bounding boxes and class probabilities."""
-#         preds = self.forward_head(x, **self.one2many)
-#         if self.end2end:
-#             x_detach = [xi.detach() for xi in x]
-#             one2one = self.forward_head(x_detach, **self.one2one)
-#             preds = {"one2many": preds, "one2one": one2one}
-#         if self.training:
-#             return preds
-#         y = self._inference(preds["one2one"] if self.end2end else preds)
-#         if self.end2end:
-#             y = self.postprocess(y.permute(0, 2, 1))
-#         return y if self.export else (y, preds)
+    def forward_head(self, x, box_head=None, cls_head=None, refine=None):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if box_head is None or cls_head is None:  # for fused inference
+            return dict()
+        bs = x[0].shape[0]
+        boxes, scores = [], []
+        for i in range(self.nl):
+            b = box_head[i](x[i])
+            s = cls_head[i](x[i])
+            if refine is not None and str(i) in refine:
+                db, dq = refine[str(i)](x[i], b)
+                b = b + db      # refined ltrb
+                s = s + dq      # quality logit -> better NMS-free top-k ranking
+            boxes.append(b.view(bs, 4 * self.reg_max, -1))
+            scores.append(s.view(bs, self.nc, -1))
+        return dict(boxes=torch.cat(boxes, dim=-1), scores=torch.cat(scores, dim=-1), feats=x)
 
-#     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
-#         """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
+    def forward(
+        self, x: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        preds = self.forward_head(x, **self.one2many)
+        if self.end2end:
+            x_detach = [xi.detach() for xi in x]
+            one2one = self.forward_head(x_detach, **self.one2one)
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
 
-#         Args:
-#             x (dict[str, torch.Tensor]): List of feature maps from different detection layers.
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
 
-#         Returns:
-#             (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
-#         """
-#         # Inference path
-#         dbox = self._get_decode_boxes(x)
-#         return torch.cat((dbox, x["scores"].sigmoid()), 1)
+        Args:
+            x (dict[str, torch.Tensor]): List of feature maps from different detection layers.
 
-#     def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
-#         """Get decoded boxes based on anchors and strides."""
-#         shape = x["feats"][0].shape  # BCHW
-#         if self.dynamic or self.shape != shape:
-#             self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
-#             self.shape = shape
+        Returns:
+            (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
+        """
+        # Inference path
+        dbox = self._get_decode_boxes(x)
+        return torch.cat((dbox, x["scores"].sigmoid()), 1)
 
-#         dbox = self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
-#         return dbox
+    def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Get decoded boxes based on anchors and strides."""
+        shape = x["feats"][0].shape  # BCHW
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
+            self.shape = shape
 
-#     def bias_init(self):
-#         """Initialize Detect() biases, WARNING: requires stride availability."""
-#         for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):  # from
-#             a[-1].bias.data[:] = 2.0  # box
-#             b[-1].bias.data[: self.nc] = math.log(
-#                 5 / self.nc / (640 / self.stride[i]) ** 2
-#             )  # cls (.01 objects, 80 classes, 640 img)
-#         if self.end2end:
-#             for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
-#                 a[-1].bias.data[:] = 2.0  # box
-#                 b[-1].bias.data[: self.nc] = math.log(
-#                     5 / self.nc / (640 / self.stride[i]) ** 2
-#                 )  # cls (.01 objects, 80 classes, 640 img)
+        dbox = self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
+        return dbox
 
-#     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
-#         """Decode bounding boxes from predictions."""
-#         return dist2bbox(
-#             bboxes,
-#             anchors,
-#             xywh=xywh and not self.end2end and not self.xyxy,
-#             dim=1,
-#         )
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):  # from
+            a[-1].bias.data[:] = 2.0  # box
+            b[-1].bias.data[: self.nc] = math.log(
+                5 / self.nc / (640 / self.stride[i]) ** 2
+            )  # cls (.01 objects, 80 classes, 640 img)
+        if self.end2end:
+            for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
+                a[-1].bias.data[:] = 2.0  # box
+                b[-1].bias.data[: self.nc] = math.log(
+                    5 / self.nc / (640 / self.stride[i]) ** 2
+                )  # cls (.01 objects, 80 classes, 640 img)
 
-#     def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
-#         """Post-processes YOLO model predictions.
+    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
+        """Decode bounding boxes from predictions."""
+        return dist2bbox(
+            bboxes,
+            anchors,
+            xywh=xywh and not self.end2end and not self.xyxy,
+            dim=1,
+        )
 
-#         Args:
-#             preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc) with last dimension
-#                 format [x, y, w, h, class_probs].
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-processes YOLO model predictions.
 
-#         Returns:
-#             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6) and last
-#                 dimension format [x, y, w, h, max_class_prob, class_index].
-#         """
-#         boxes, scores = preds.split([4, self.nc], dim=-1)
-#         scores, conf, idx = self.get_topk_index(scores, self.max_det)
-#         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
-#         return torch.cat([boxes, scores, conf], dim=-1)
+        Args:
+            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc) with last dimension
+                format [x, y, w, h, class_probs].
 
-#     def get_topk_index(self, scores: torch.Tensor, max_det: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#         """Get top-k indices from scores.
+        Returns:
+            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6) and last
+                dimension format [x, y, w, h, max_class_prob, class_index].
+        """
+        boxes, scores = preds.split([4, self.nc], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        return torch.cat([boxes, scores, conf], dim=-1)
 
-#         Args:
-#             scores (torch.Tensor): Scores tensor with shape (batch_size, num_anchors, num_classes).
-#             max_det (int): Maximum detections per image.
+    def get_topk_index(self, scores: torch.Tensor, max_det: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get top-k indices from scores.
 
-#         Returns:
-#             (torch.Tensor, torch.Tensor, torch.Tensor): Top scores, class indices, and filtered indices.
-#         """
-#         batch_size, anchors, nc = scores.shape  # i.e. shape(16,8400,84)
-#         # Use max_det directly during export for TensorRT compatibility (requires k to be constant),
-#         # otherwise use min(max_det, anchors) for safety with small inputs during Python inference
-#         k = max_det if self.export else min(max_det, anchors)
-#         if self.agnostic_nms:
-#             scores, labels = scores.max(dim=-1, keepdim=True)
-#             scores, indices = scores.topk(k, dim=1)
-#             labels = labels.gather(1, indices)
-#             return scores, labels, indices
-#         ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
-#         scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
-#         scores, index = scores.flatten(1).topk(k)
-#         idx = ori_index[torch.arange(batch_size)[..., None], index // nc]  # original index
-#         return scores[..., None], (index % nc)[..., None].float(), idx
+        Args:
+            scores (torch.Tensor): Scores tensor with shape (batch_size, num_anchors, num_classes).
+            max_det (int): Maximum detections per image.
 
-#     def fuse(self) -> None:
-#         """Remove the one2many head for inference optimization."""
-#         self.cv2 = self.cv3 = None
+        Returns:
+            (torch.Tensor, torch.Tensor, torch.Tensor): Top scores, class indices, and filtered indices.
+        """
+        batch_size, anchors, nc = scores.shape  # i.e. shape(16,8400,84)
+        # Use max_det directly during export for TensorRT compatibility (requires k to be constant),
+        # otherwise use min(max_det, anchors) for safety with small inputs during Python inference
+        k = max_det if self.export else min(max_det, anchors)
+        if self.agnostic_nms:
+            scores, labels = scores.max(dim=-1, keepdim=True)
+            scores, indices = scores.topk(k, dim=1)
+            labels = labels.gather(1, indices)
+            return scores, labels, indices
+        ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
+        scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
+        scores, index = scores.flatten(1).topk(k)
+        idx = ori_index[torch.arange(batch_size)[..., None], index // nc]  # original index
+        return scores[..., None], (index % nc)[..., None].float(), idx
 
+    def fuse(self) -> None:
+        """Remove the one2many head for inference optimization."""
+        self.cv2 = self.cv3 = None
+        self.refine = None      # one2one_refine stays — it's the inference path
+
+
+
+class DetectRefine(Detect):
+    """YOLO26 Detect head with box-guided coarse-to-fine refinement for tiny objects.
+
+    Per level, per branch (one2many AND one2one, mirrored like stock):
+      1) stock towers -> coarse ltrb (reg_max=1, DFL-free) + class logits
+      2) BoxPointSampler gathers features at the coarse box's key points + context ring
+      3) zero-init 1x1 convs emit: box residual (added to coarse ltrb) and a quality
+         logit (added to class logits -> better top-k ranking in the NMS-free path)
+
+    The returned dict signature is identical to Detect, so TAL/STAL, ProgLoss,
+    E2EDetectLoss, postprocess() and fuse()/export paths run unchanged.
+    """
+
+    # knobs (override as class attrs before model build, avoids YAML plumbing)
+    refine_cmid = 32          # sampler channel width (drop to 16 for imgsz>=1280 to save memory)
+    refine_cout = 64
+    refine_min_extent = 1.0   # cells; sampling floor for sub-cell boxes
+    refine_ctx = 2.0          # context ring scale; 0 disables
+    refine_levels = None      # e.g. (0,) or (0, 1) to refine only P3 / P3+P4; None = all levels
+
+    def __init__(self, nc: int = 80, reg_max: int = 1, end2end: bool = True, ch: tuple = ()):
+        assert reg_max == 1, "DetectRefine targets the DFL-free (reg_max=1) YOLO26 head"
+        super().__init__(nc, reg_max, end2end, ch)
+        levels = tuple(range(len(ch))) if self.refine_levels is None else tuple(self.refine_levels)
+        self.refine = nn.ModuleDict({
+            str(i): TinyRefine(ch[i], self.refine_cmid, self.refine_cout,
+                               self.refine_min_extent, self.refine_ctx)
+            for i in levels
+        })
+        if end2end:
+            self.one2one_refine = copy.deepcopy(self.refine)
+
+    @property
+    def one2many(self):
+        return dict(box_head=self.cv2, cls_head=self.cv3,
+                    refine=getattr(self, "refine", None))
+
+    @property
+    def one2one(self):
+        # accessing one2one_cv2 first preserves the stock hasattr(self, "one2one") trick
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3,
+                    refine=getattr(self, "one2one_refine", None))
+
+    def forward_head(self, x, box_head=None, cls_head=None, refine=None):
+        if box_head is None or cls_head is None:  # fused inference (one2many dropped)
+            return dict()
+        bs = x[0].shape[0]
+        boxes, scores = [], []
+        for i in range(self.nl):
+            b = box_head[i](x[i])   # (bs, 4, h, w) coarse ltrb, grid units
+            s = cls_head[i](x[i])   # (bs, nc, h, w)
+            if refine is not None and str(i) in refine:
+                db, dq = refine[str(i)](x[i], b)
+                b = b + db          # refined ltrb — coarse branch keeps its gradient
+                s = s + dq          # quality-shifted logits — fixes NMS-free top-k ranking
+            boxes.append(b.view(bs, 4 * self.reg_max, -1))
+            scores.append(s.view(bs, self.nc, -1))
+        return dict(boxes=torch.cat(boxes, -1), scores=torch.cat(scores, -1), feats=x)
+
+    def fuse(self):
+        super().fuse()        # drops one2many towers (cv2 = cv3 = None)
+        self.refine = None    # drop one2many refinement too; one2one_refine stays for inference
 
 
 class Segment(Detect):
