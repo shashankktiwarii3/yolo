@@ -25,20 +25,6 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
 
-def nwd_loss(pred_boxes, target_boxes, constant=12.0, eps=1e-7):
-    """Computes 1 - NWD to be used as a differentiable loss. Boxes in xyxy format."""
-    x1, y1, x2, y2 = pred_boxes.unbind(-1)
-    cx1, cy1, w1, h1 = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
-    
-    x1, y1, x2, y2 = target_boxes.unbind(-1)
-    cx2, cy2, w2, h2 = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
-    
-    center_dist = (cx1 - cx2).pow(2) + (cy1 - cy2).pow(2)
-    wh_dist = 0.25 * ((w1 - w2).pow(2) + (h1 - h2).pow(2))
-    w2_dist = center_dist + wh_dist
-    
-    nwd = torch.exp(-torch.sqrt(w2_dist + eps) / constant)
-    return 1.0 - nwd
 
 
 class VarifocalLoss(nn.Module):
@@ -137,43 +123,6 @@ class BboxLoss(nn.Module):
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
 
-    # def forward(
-    #     self,
-    #     pred_dist: torch.Tensor,
-    #     pred_bboxes: torch.Tensor,
-    #     anchor_points: torch.Tensor,
-    #     target_bboxes: torch.Tensor,
-    #     target_scores: torch.Tensor,
-    #     target_scores_sum: torch.Tensor,
-    #     fg_mask: torch.Tensor,
-    #     imgsz: torch.Tensor,
-    #     stride: torch.Tensor,
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     """Compute IoU and DFL losses for bounding boxes."""
-    #     weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-    #     iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-    #     loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-
-    #     # DFL loss
-    #     if self.dfl_loss:
-    #         target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
-    #         loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
-    #         loss_dfl = loss_dfl.sum() / target_scores_sum
-    #     else:
-    #         target_ltrb = bbox2dist(anchor_points, target_bboxes)
-    #         # normalize ltrb by image size
-    #         target_ltrb = target_ltrb * stride
-    #         target_ltrb[..., 0::2] /= imgsz[1]
-    #         target_ltrb[..., 1::2] /= imgsz[0]
-    #         pred_dist = pred_dist * stride
-    #         pred_dist[..., 0::2] /= imgsz[1]
-    #         pred_dist[..., 1::2] /= imgsz[0]
-    #         loss_dfl = (
-    #             F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
-    #         )
-    #         loss_dfl = loss_dfl.sum() / target_scores_sum
-
-    #     return loss_iou, loss_dfl
     def forward(
         self,
         pred_dist: torch.Tensor,
@@ -188,23 +137,10 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        
-        # --- AREA-AWARE NWD/IOU LOSS BLOCK ---
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        base_loss_iou = 1.0 - iou
-        
-        loss_nwd = nwd_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask]).unsqueeze(-1)
-        
-        # Calculate areas to identify tiny objects
-        box_areas = (target_bboxes[fg_mask, 2] - target_bboxes[fg_mask, 0]) * (target_bboxes[fg_mask, 3] - target_bboxes[fg_mask, 1])
-        tiny_mask = (box_areas < 1024.0).float().unsqueeze(-1)
-        
-        # Hard Switch: CIoU for large, NWD for tiny
-        blended_loss = (base_loss_iou * (1.0 - tiny_mask)) + (loss_nwd * tiny_mask)
-        loss_iou = (blended_loss * weight).sum() / target_scores_sum
-        # -------------------------------------
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
-        # DFL loss (Unchanged: Naturally handles reg_max=1 via the else block)
+        # DFL loss
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
             loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
@@ -222,8 +158,9 @@ class BboxLoss(nn.Module):
                 F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
             )
             loss_dfl = loss_dfl.sum() / target_scores_sum
-            
+
         return loss_iou, loss_dfl
+
 
 class RLELoss(nn.Module):
     """Residual Log-Likelihood Estimation Loss.
@@ -1224,48 +1161,13 @@ class E2ELoss:
         # final gain
         self.final_o2m = 0.1
 
-    # def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    #     """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-    #     preds = self.one2many.parse_output(preds)
-    #     one2many, one2one = preds["one2many"], preds["one2one"]
-    #     loss_one2many = self.one2many.loss(one2many, batch)
-    #     loss_one2one = self.one2one.loss(one2one, batch)
-    #     return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         preds = self.one2many.parse_output(preds)
         one2many, one2one = preds["one2many"], preds["one2one"]
         loss_one2many = self.one2many.loss(one2many, batch)
         loss_one2one = self.one2one.loss(one2one, batch)
-        
-        # --- INJECT DENSITY-AWARE DISTILLATION LOSS ---
-        # Extract raw classification logits (shape: bs, nc, num_anchors)
-        cls_one2many = one2many["scores"]
-        cls_one2one = one2one["scores"]
-        
-        # Get soft targets from the one2many (teacher) head
-        p_teacher = torch.sigmoid(cls_one2many.detach())
-        
-        # Identify dense regions where teacher is confident (max class prob > 0.5)
-        density_mask = (p_teacher.max(dim=1)[0] > 0.5).float().unsqueeze(1)
-        
-        # Calculate BCE distillation loss to force student to match teacher's soft targets
-        loss_distill = F.binary_cross_entropy_with_logits(
-            cls_one2one, p_teacher, reduction="none"
-        )
-        
-        # Apply mask and average
-        loss_distill = (loss_distill * density_mask).mean()
-        
-        # Add distillation to the classification loss (index 1) of the one2one tensor
-        # This prevents breaking the 3-element tuple structure expected by the trainer
-        distill_weight = 0.1
-        loss_one2one_tensor = loss_one2one[0].clone()
-        loss_one2one_tensor[1] = loss_one2one_tensor[1] + distill_weight * loss_distill
-        
-        # Return combined losses
-        total_loss = loss_one2many[0] * self.o2m + loss_one2one_tensor * self.o2o
-        return total_loss, loss_one2one[1]
+        return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
 
     def update(self) -> None:
         """Update the weights for one-to-many and one-to-one losses based on the decay schedule."""

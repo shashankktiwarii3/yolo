@@ -2214,3 +2214,94 @@ class SemanticFrequencyReassembly(nn.Module):
         )
 
         return target + self.layer_scale * detail * spatial * channel
+    
+
+
+class MDConv(nn.Module):
+    """Mixed-dilation depthwise 3x3. Channels split across dilations (1, 2, 3):
+    d=1 preserves pixel-level detail, d=2/3 add context (RF 5, 7) with no
+    downsampling. ~9C params vs ~9C^2 for a dense 3x3."""
+
+    def __init__(self, c: int, dilations=(1, 2, 3)):
+        super().__init__()
+        k = len(dilations)
+        self.splits = [c // k + (1 if i < c % k else 0) for i in range(k)]
+        self.convs = nn.ModuleList(
+            nn.Conv2d(ci, ci, 3, 1, padding=d, dilation=d, groups=ci, bias=False)
+            for ci, d in zip(self.splits, dilations)
+        )
+        self.bn = nn.BatchNorm2d(c)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        y = torch.cat([m(xi) for m, xi in zip(self.convs, x.split(self.splits, 1))], 1)
+        return self.act(self.bn(y))
+
+
+class LCSA(nn.Module):
+    """Local Contrast & Surround Attention.
+    Divisive-normalized center-surround gating: sharpens each location against its
+    local surround instead of aggregating context, so crowded tiny objects stay
+    separable for YOLO26's one-to-one NMS-free head."""
+
+    def __init__(self, c1, c2=None, kc=3, ks=9, alpha_init=0.25):
+        super().__init__()
+        ch = c1
+        self.ks = ks
+        self.center   = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)
+        self.surround = nn.Conv2d(ch, ch, ks, padding=ks // 2, groups=ch)
+        self.alpha = nn.Parameter(alpha_init * torch.ones(1, ch, 1, 1))  # contrast gain
+        self.beta  = nn.Parameter(torch.ones(1, ch, 1, 1))               # semi-saturation
+        self.pw    = nn.Conv2d(ch, ch, 1)
+        with torch.no_grad():
+            self.center.weight.zero_()
+            self.center.weight[:, :, kc // 2, kc // 2] = 1.0  # delta  -> c = x at init
+            self.surround.weight.fill_(1.0 / (ks * ks))       # box blur
+            if self.center.bias is not None:   self.center.bias.zero_()
+            if self.surround.bias is not None: self.surround.bias.zero_()
+            nn.init.dirac_(self.pw.weight)                    # identity 1x1
+            if self.pw.bias is not None:       self.pw.bias.zero_()
+
+    def forward(self, x):
+        c = self.center(x)
+        s = self.surround(x)
+        e = F.avg_pool2d(x * x, self.ks, stride=1, padding=self.ks // 2)  # local energy
+        contrast = (c - s) * torch.rsqrt(e + self.beta.pow(2) + 1e-6)
+        gate = torch.sigmoid(self.alpha * contrast)
+        return x * self.pw(c * gate)
+
+
+class TinyBlock(nn.Module):
+    """MDConv (cheap spatial) -> PW expand -> PW project -> LCSA, with residual.
+    ~(4C^2 + 9C) params vs 9C^2 for the standard Bottleneck it replaces."""
+
+    def __init__(self, c: int, shortcut: bool = True, e: float = 2.0):
+        super().__init__()
+        c_ = int(c * e)
+        self.mdc = MDConv(c)
+        self.pw1 = Conv(c, c_, 1)
+        self.pw2 = Conv(c_, c, 1, act=False)
+        self.attn = LCSA(c)
+        self.add = shortcut
+
+    def forward(self, x):
+        y = self.attn(self.pw2(self.pw1(self.mdc(x))))
+        return x + y if self.add else y
+
+
+class C3k2_MDSA(C2f):
+    """Drop-in C3k2 replacement. Same YAML args as C3k2: (c2, c3k, e, attn)."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            nn.Sequential(
+                TinyBlock(self.c, shortcut),
+                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+            )
+            if attn  # do NOT use at P3 — quadratic attention on a huge token grid
+            else nn.Sequential(TinyBlock(self.c, shortcut), TinyBlock(self.c, shortcut))
+            if c3k
+            else TinyBlock(self.c, shortcut)
+            for _ in range(n)
+        )

@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import HighFreqInject, SemanticFrequencyReassembly
+from ultralytics.nn.modules.block import HighFreqInject, SemanticFrequencyReassembly, C3k2_MDSA
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1670,7 +1670,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m is C3k2:  # for M/L/X sizes
+            if m is {C3k2, C3k2_MDSA}:  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
