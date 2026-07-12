@@ -103,7 +103,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.nn.modules.conv import Conv
-from ultralytics.nn.modules.head import Detect
 
 
 class BoxPointSampler(nn.Module):
