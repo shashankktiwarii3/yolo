@@ -2067,6 +2067,42 @@ class RealNVP(nn.Module):
         return self.prior.log_prob(z) + log_det
 
 
+# class HighFreqInject(nn.Module):
+#     """Injects high-frequency spatial details from a higher-resolution feature map (e.g., P2) into a lower-resolution map (e.g., P3)."""
+    
+#     def __init__(self, c1, c2): 
+#         super().__init__()
+#         # c1 = source channels (P2), c2 = target channels (P3)
+        
+#         # Laplacian kernel for edge detection (high-pass filter)
+#         self.laplacian = nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False)
+#         kernel = torch.tensor([[[[0., 1., 0.],
+#                                  [1., -4., 1.],
+#                                  [0., 1., 0.]]]], dtype=torch.float32)
+        
+#         # Safely register the frozen kernel as a non-learnable parameter
+#         self.laplacian.weight = nn.Parameter(kernel.repeat(c1, 1, 1, 1), requires_grad=False)
+        
+#         # Projection to match target channels AND downsample spatial dimensions
+#         # k=3, s=2 cuts the spatial dimensions in half to match the P3 layer
+#         self.proj = Conv(c1, c2, k=3, s=2) 
+
+#     def forward(self, x):
+#         target, source = x[0], x[1]
+#         edges = self.laplacian(source)
+#         projected = self.proj(edges)
+    
+#         if not getattr(self, "_dbg_printed", False):
+#             print(f"[HFI fwd] target={tuple(target.shape)}  source={tuple(source.shape)}  "
+#                   f"proj_out={tuple(projected.shape)}")
+#             self._dbg_printed = True
+    
+#         return target + projected
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class HighFreqInject(nn.Module):
     """Injects high-frequency spatial details from a higher-resolution feature map (e.g., P2) into a lower-resolution map (e.g., P3)."""
     
@@ -2074,22 +2110,24 @@ class HighFreqInject(nn.Module):
         super().__init__()
         # c1 = source channels (P2), c2 = target channels (P3)
         
-        # Laplacian kernel for edge detection (high-pass filter)
-        self.laplacian = nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False)
+        # Define the Laplacian kernel
         kernel = torch.tensor([[[[0., 1., 0.],
                                  [1., -4., 1.],
                                  [0., 1., 0.]]]], dtype=torch.float32)
         
-        # Safely register the frozen kernel as a non-learnable parameter
-        self.laplacian.weight = nn.Parameter(kernel.repeat(c1, 1, 1, 1), requires_grad=False)
+        # FIX: Use register_buffer instead of nn.Parameter(requires_grad=False).
+        # Buffers are ignored by the optimizer and the Ultralytics trainer.
+        self.register_buffer('laplacian_kernel', kernel.repeat(c1, 1, 1, 1))
         
         # Projection to match target channels AND downsample spatial dimensions
-        # k=3, s=2 cuts the spatial dimensions in half to match the P3 layer
         self.proj = Conv(c1, c2, k=3, s=2) 
 
     def forward(self, x):
         target, source = x[0], x[1]
-        edges = self.laplacian(source)
+        
+        # FIX: Use F.conv2d with the registered buffer
+        # groups=source.shape[1] applies the kernel depthwise, exactly like your original Conv2d
+        edges = F.conv2d(source, self.laplacian_kernel, padding=1, groups=source.shape[1])
         projected = self.proj(edges)
     
         if not getattr(self, "_dbg_printed", False):
@@ -2098,8 +2136,6 @@ class HighFreqInject(nn.Module):
             self._dbg_printed = True
     
         return target + projected
-
-
 
 # class HighFreqInject(nn.Module):
 #     """v2: lossless space-to-depth transfer of P2 high-frequency detail into P3.

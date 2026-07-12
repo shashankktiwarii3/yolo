@@ -95,53 +95,97 @@ class TanhRefine(nn.Module):
 
 
 
+# class CellRefine(nn.Module):
+#     """Lightweight bounding box refinement for tiny objects in DFL-free YOLO (YOLO26).
+#     Predicts strictly bounded, small deltas in cell units for the highest resolution feature maps.
+#     """
+#     def __init__(self, ch: tuple, max_delta: float = 0.25):
+#         super().__init__()
+#         self.nl = len(ch)
+#         # Max shift is 0.25 cells. On stride 8, this is exactly 2 pixels. 
+#         # Safe for tiny objects (<32px) without causing massive coordinate jumps.
+#         self.max_delta = max_delta  
+        
+#         self.heads = nn.ModuleList()
+#         self.scales = nn.ParameterList()
+        
+#         for i, c in enumerate(ch):
+#             if i < 2:  # ONLY apply to stride 8 and 16 (first two levels)
+#                 # Pure linear projections. No BN/SiLU to keep it lightweight and preserve gradient flow.
+#                 self.heads.append(nn.Sequential(
+#                     nn.Conv2d(c, c // 2, 1),
+#                     nn.Conv2d(c // 2, c // 2, 3, padding=1),
+#                     nn.Conv2d(c // 2, 4, 1) # Outputs 4 channels (ltrb)
+#                 ))
+#                 # Initialize bias to 0 so it starts as a perfect mathematical no-op
+#                 nn.init.zeros_(self.heads[i][-1].bias)
+                
+#                 # Learnable scale. Init small (0.05) -> max initial delta is 0.0125 cells
+#                 self.scales.append(nn.Parameter(torch.tensor(0.05)))
+#             else:
+#                 self.heads.append(None)
+#                 self.scales.append(nn.Parameter(torch.zeros(1), requires_grad=False))
+
+#     def forward(self, feats: list[torch.Tensor]) -> torch.Tensor:
+#         """Returns refined deltas in cell units, shape (bs, 4, sum(H*W))."""
+#         outs = []
+#         for i in range(self.nl):
+#             if self.heads[i] is not None:
+#                 delta = self.heads[i](feats[i]) # (bs, 4, h, w)
+#                 # Bound with tanh, scale by level-specific learnable scale
+#                 delta = torch.tanh(delta) * self.scales[i] * self.max_delta
+#                 # Flatten spatial dimensions to match the base head's output shape
+#                 outs.append(delta.view(delta.shape[0], 4, -1)) 
+#             else:
+#                 bs, _, h, w = feats[i].shape
+#                 outs.append(torch.zeros(bs, 4, h * w, device=feats[i].device))
+        
+#         return torch.cat(outs, dim=-1) # (bs, 4, sum(H*W))
+    
 class CellRefine(nn.Module):
-    """Lightweight bounding box refinement for tiny objects in DFL-free YOLO (YOLO26).
-    Predicts strictly bounded, small deltas in cell units for the highest resolution feature maps.
-    """
+    """Lightweight bounding box refinement for tiny objects in DFL-free YOLO (YOLO26)."""
     def __init__(self, ch: tuple, max_delta: float = 0.25):
         super().__init__()
         self.nl = len(ch)
-        # Max shift is 0.25 cells. On stride 8, this is exactly 2 pixels. 
-        # Safe for tiny objects (<32px) without causing massive coordinate jumps.
         self.max_delta = max_delta  
         
         self.heads = nn.ModuleList()
-        self.scales = nn.ParameterList()
-        
         for i, c in enumerate(ch):
-            if i < 2:  # ONLY apply to stride 8 and 16 (first two levels)
-                # Pure linear projections. No BN/SiLU to keep it lightweight and preserve gradient flow.
+            if i < 2:  # ONLY apply to stride 8 and 16
                 self.heads.append(nn.Sequential(
                     nn.Conv2d(c, c // 2, 1),
                     nn.Conv2d(c // 2, c // 2, 3, padding=1),
-                    nn.Conv2d(c // 2, 4, 1) # Outputs 4 channels (ltrb)
+                    nn.Conv2d(c // 2, 4, 1)
                 ))
-                # Initialize bias to 0 so it starts as a perfect mathematical no-op
                 nn.init.zeros_(self.heads[i][-1].bias)
-                
-                # Learnable scale. Init small (0.05) -> max initial delta is 0.0125 cells
-                self.scales.append(nn.Parameter(torch.tensor(0.05)))
             else:
                 self.heads.append(None)
-                self.scales.append(nn.Parameter(torch.zeros(1), requires_grad=False))
+                
+        # FIX: Use a single Parameter for all scales, and a buffer mask to freeze the ones we don't want.
+        # This prevents the trainer from seeing individual parameters with requires_grad=False.
+        self.scales = nn.Parameter(torch.full((self.nl,), 0.05))
+        
+        # Mask to freeze scales for i >= 2 (stride 32+). 
+        # Multiplying by this mask ensures scales[2:] remain exactly 0.0 and receive no gradients.
+        mask = torch.ones(self.nl)
+        mask[2:] = 0.0
+        self.register_buffer('scale_mask', mask)
 
     def forward(self, feats: list[torch.Tensor]) -> torch.Tensor:
-        """Returns refined deltas in cell units, shape (bs, 4, sum(H*W))."""
         outs = []
+        # Apply the mask so scales for i >= 2 are exactly 0
+        active_scales = self.scales * self.scale_mask
+        
         for i in range(self.nl):
             if self.heads[i] is not None:
-                delta = self.heads[i](feats[i]) # (bs, 4, h, w)
-                # Bound with tanh, scale by level-specific learnable scale
-                delta = torch.tanh(delta) * self.scales[i] * self.max_delta
-                # Flatten spatial dimensions to match the base head's output shape
-                outs.append(delta.view(delta.shape[0], 4, -1)) 
+                delta = self.heads[i](feats[i])
+                delta = torch.tanh(delta) * active_scales[i] * self.max_delta
+                outs.append(delta.view(delta.shape[0], 4, -1))
             else:
                 bs, _, h, w = feats[i].shape
                 outs.append(torch.zeros(bs, 4, h * w, device=feats[i].device))
         
-        return torch.cat(outs, dim=-1) # (bs, 4, sum(H*W))
-    
+        return torch.cat(outs, dim=-1)
 class Detect(nn.Module):
     """YOLO Detect head for object detection models.
 
