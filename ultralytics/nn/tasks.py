@@ -1649,9 +1649,9 @@ def parse_model(d, ch, verbose=True):
         #     c2 = c_target
         #     args = [c_target, c_source, *args]
 
-        elif m is LCSA:
-            c1 = c2 = ch[f]              # channel-preserving
-            args = [c1, c2, *args[1:]]
+        # elif m is LCSA:
+        #     c1 = c2 = ch[f]              # channel-preserving
+        #     args = [c1, c2, *args[1:]]
 
         elif m in base_modules:
             c1, c2 = ch[f], args[0]
