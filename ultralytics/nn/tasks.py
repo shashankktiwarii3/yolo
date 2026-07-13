@@ -76,6 +76,14 @@ from ultralytics.nn.modules import (
     v10Detect,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
+
+# Row-8 tiny-object sigma head (detect_sigma.py at repo root)
+try:
+    import sys, os as _os
+    sys.path.insert(0, str(_os.path.dirname(_os.path.dirname(_os.path.dirname(__file__)))))
+    from detect_sigma import DetectSigma
+except ImportError:
+    DetectSigma = None
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2ELoss,
@@ -1681,6 +1689,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                *([DetectSigma] if DetectSigma is not None else []),
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
