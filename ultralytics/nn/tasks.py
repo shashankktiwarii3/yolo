@@ -47,6 +47,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    DetectSigma,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -78,6 +79,8 @@ from ultralytics.nn.modules import (
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
+    TinyE2ELoss,
+    TinyDetectionLoss,
     E2ELoss,
     PoseLoss26,
     v8ClassificationLoss,
@@ -512,6 +515,10 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+    # def init_criterion(self):
+    #     """Initialize the loss criterion for the DetectionModel."""
+    #     # Add import at top of tasks.py: from ultralytics.utils.loss import TinyE2ELoss
+    #     return TinyE2ELoss(self, use_rle=True) if getattr(self, "end2end", False) else TinyDetectionLoss(self, use_rle=True)
 
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
@@ -1693,6 +1700,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                DetectSigma,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,

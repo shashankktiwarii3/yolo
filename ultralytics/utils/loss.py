@@ -17,6 +17,8 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
 
+from .saga_assigner import SAGAAssigner
+from .rle_box import RLEBoxLoss
 
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
@@ -1236,3 +1238,117 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion(preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+class TinyDetectionLoss(v8DetectionLoss):
+    """Single-branch loss integrating SAGA (Prop 1) and RLE-Box (Prop 2)."""
+    def __init__(self, model, saga_kw=None, use_rle=False, lambda_rle=1.5, tal_topk=10, tal_topk2=None):
+        super().__init__(model, tal_topk, tal_topk2)
+        saga_kw = dict(saga_kw or {})
+        
+        # Wire SAGA Assigner
+        self.assigner = SAGAAssigner(
+            topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0, 
+            stride=self.stride.tolist(), topk2=tal_topk2, **saga_kw
+        )
+        self.use_rle = use_rle
+        self.lambda_rle = lambda_rle
+        self.rle = RLEBoxLoss() if use_rle else None
+
+    def get_assigned_targets_and_loss(self, preds, batch):
+        loss = torch.zeros(4 if self.use_rle else 3, device=self.device)  # box, cls, dfl, rle
+        pred_distri, pred_scores = (
+            preds["boxes"].permute(0, 2, 1).contiguous(),
+            preds["scores"].permute(0, 2, 1).contiguous(),
+        )
+        pred_sig = preds["sigmas"].permute(0, 2, 1).contiguous().sigmoid() if self.use_rle else None
+        
+        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+        
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        
+        # WIRE SAGA: Pass strides to assigner
+        self.assigner.set_anchor_strides(stride_tensor)
+        
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+        
+        target_scores_sum = max(target_scores.sum(), 1)
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        
+        if fg_mask.sum():
+            target_bboxes_grid = target_bboxes / stride_tensor
+            weight = target_scores.sum(-1, keepdim=True)
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes_grid[fg_mask], xywh=False, CIoU=True)
+            loss[0] = ((1.0 - iou) * weight[fg_mask]).sum() / target_scores_sum
+            
+            # WIRE RLE-BOX
+            if self.use_rle:
+                tgt_ltrb = bbox2dist(anchor_points, target_bboxes_grid, reg_max=1e9)
+                loss[3] = self.rle(
+                    pred_distri[fg_mask], pred_sig[fg_mask], tgt_ltrb[fg_mask], 
+                    weight[fg_mask], target_scores_sum
+                )
+                
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        if self.use_rle:
+            loss[3] *= self.lambda_rle
+            
+        return (
+            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
+            loss,
+            loss.detach(),
+        )
+
+    def loss(self, preds, batch):
+        batch_size = preds["boxes"].shape[0]
+        _, loss, loss_detach = self.get_assigned_targets_and_loss(preds, batch)
+        return loss.sum() * batch_size, loss_detach
+
+
+class TinyE2ELoss(nn.Module):
+    """Dual-head wrapper using YOLO26's standard ProgLoss decay schedule."""
+    def __init__(self, model, saga_kw=None, use_rle=True, lambda_rle=1.5):
+        super().__init__()
+        saga_kw_o2m = dict(saga_kw or {}); saga_kw_o2m["o2o"] = False
+        saga_kw_o2o = dict(saga_kw or {}); saga_kw_o2o["o2o"] = True
+        
+        self.one2many = TinyDetectionLoss(model, saga_kw_o2m, use_rle, lambda_rle, tal_topk=10)
+        self.one2one = TinyDetectionLoss(model, saga_kw_o2o, use_rle, lambda_rle, tal_topk=7, tal_topk2=1)
+        
+        # Standard YOLO26 ProgLoss Decay variables
+        self.updates = 0
+        self.total = 1.0
+        self.o2m = 0.8
+        self.o2o = self.total - self.o2m
+        self.o2m_copy = self.o2m
+        self.final_o2m = 0.1
+
+    def __call__(self, preds, batch):
+        preds = self.one2many.parse_output(preds)
+        one2many, one2one = preds["one2many"], preds["one2one"]
+        loss_one2many = self.one2many.loss(one2many, batch)
+        loss_one2one = self.one2one.loss(one2one, batch)
+        return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
+
+    def update(self) -> None:
+        self.updates += 1
+        self.o2m = self.decay(self.updates)
+        self.o2o = max(self.total - self.o2m, 0)
+
+    def decay(self, x) -> float:
+        return max(1 - x / max(self.one2one.hyp.epochs - 1, 1), 0) * (self.o2m_copy - self.final_o2m) + self.final_o2m

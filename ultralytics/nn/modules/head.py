@@ -1548,6 +1548,64 @@ class Detect(nn.Module):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
 
+import copy
+import torch
+import torch.nn as nn
+from ultralytics.nn.modules.conv import Conv
+# Ensure Detect is imported (it should be in this file)
+
+class DetectSigma(Detect):
+    """YOLO26 Detect head with a 4-channel sigma branch for RLE-Box and sigma-Rank."""
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        super().__init__(nc, reg_max, end2end, ch)
+        c2 = max((16, ch[0] // 4, self.reg_max * 4))
+        
+        # Sigma branch (mirrors cv2 structure)
+        self.cv_sig = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4, 1)) for x in ch
+        )
+        if end2end:
+            self.one2one_cv_sig = copy.deepcopy(self.cv_sig)
+
+    def forward(self, x):
+        bs = x[0].shape[0]
+        
+        # One-to-Many Branch
+        boxes = torch.cat([self.cv2[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        scores = torch.cat([self.cv3[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        sigmas = torch.cat([self.cv_sig[i](x[i]).view(bs, 4, -1) for i in range(self.nl)], dim=-1)
+        preds = dict(boxes=boxes, scores=scores, sigmas=sigmas, feats=x)
+        
+        # One-to-One Branch (End-to-End)
+        if self.end2end:
+            x_detach = [xi.detach() for xi in x]
+            o2o_boxes = torch.cat([self.one2one_cv2[i](x_detach[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+            o2o_scores = torch.cat([self.one2one_cv3[i](x_detach[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+            o2o_sigmas = torch.cat([self.one2one_cv_sig[i](x_detach[i]).view(bs, 4, -1) for i in range(self.nl)], dim=-1)
+            one2one = dict(boxes=o2o_boxes, scores=o2o_scores, sigmas=o2o_sigmas, feats=x_detach)
+            preds = {"one2many": preds, "one2one": one2one}
+            
+        if self.training:
+            return preds
+            
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        dbox = self._get_decode_boxes(x)
+        scores = x["scores"].sigmoid()
+        
+        # PROPOSAL 2: sigma-Rank (Uncertainty-calibrated ranking)
+        if "sigmas" in x and not self.export:
+            scale = dbox[:, 2:4].mean(dim=1, keepdim=True) 
+            pred_sig = x["sigmas"].sigmoid()
+            rel = pred_sig / (scale + 1.0)
+            q = torch.exp(-0.5 * rel.mean(dim=1, keepdim=True)) # gamma=0.5
+            scores = scores * q
+            
+        return torch.cat((dbox, scores), 1)
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
