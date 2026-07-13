@@ -1255,68 +1255,68 @@ class CellRefine(nn.Module):
 
 
 
-class DetectRefine(Detect):
-    """YOLO26 Detect head with box-guided coarse-to-fine refinement for tiny objects.
+# class DetectRefine(Detect):
+#     """YOLO26 Detect head with box-guided coarse-to-fine refinement for tiny objects.
 
-    Per level, per branch (one2many AND one2one, mirrored like stock):
-      1) stock towers -> coarse ltrb (reg_max=1, DFL-free) + class logits
-      2) BoxPointSampler gathers features at the coarse box's key points + context ring
-      3) zero-init 1x1 convs emit: box residual (added to coarse ltrb) and a quality
-         logit (added to class logits -> better top-k ranking in the NMS-free path)
+#     Per level, per branch (one2many AND one2one, mirrored like stock):
+#       1) stock towers -> coarse ltrb (reg_max=1, DFL-free) + class logits
+#       2) BoxPointSampler gathers features at the coarse box's key points + context ring
+#       3) zero-init 1x1 convs emit: box residual (added to coarse ltrb) and a quality
+#          logit (added to class logits -> better top-k ranking in the NMS-free path)
 
-    The returned dict signature is identical to Detect, so TAL/STAL, ProgLoss,
-    E2EDetectLoss, postprocess() and fuse()/export paths run unchanged.
-    """
+#     The returned dict signature is identical to Detect, so TAL/STAL, ProgLoss,
+#     E2EDetectLoss, postprocess() and fuse()/export paths run unchanged.
+#     """
 
-    # knobs (override as class attrs before model build, avoids YAML plumbing)
-    refine_cmid = 32          # sampler channel width (drop to 16 for imgsz>=1280 to save memory)
-    refine_cout = 64
-    refine_min_extent = 1.0   # cells; sampling floor for sub-cell boxes
-    refine_ctx = 2.0          # context ring scale; 0 disables
-    refine_levels = None      # e.g. (0,) or (0, 1) to refine only P3 / P3+P4; None = all levels
+#     # knobs (override as class attrs before model build, avoids YAML plumbing)
+#     refine_cmid = 32          # sampler channel width (drop to 16 for imgsz>=1280 to save memory)
+#     refine_cout = 64
+#     refine_min_extent = 1.0   # cells; sampling floor for sub-cell boxes
+#     refine_ctx = 2.0          # context ring scale; 0 disables
+#     refine_levels = None      # e.g. (0,) or (0, 1) to refine only P3 / P3+P4; None = all levels
 
-    def __init__(self, nc: int = 80, reg_max: int = 1, end2end: bool = True, ch: tuple = ()):
-        assert reg_max == 1, "DetectRefine targets the DFL-free (reg_max=1) YOLO26 head"
-        super().__init__(nc, reg_max, end2end, ch)
-        levels = tuple(range(len(ch))) if self.refine_levels is None else tuple(self.refine_levels)
-        self.refine = nn.ModuleDict({
-            str(i): TinyRefine(ch[i], self.refine_cmid, self.refine_cout,
-                               self.refine_min_extent, self.refine_ctx)
-            for i in levels
-        })
-        if end2end:
-            self.one2one_refine = copy.deepcopy(self.refine)
+#     def __init__(self, nc: int = 80, reg_max: int = 1, end2end: bool = True, ch: tuple = ()):
+#         assert reg_max == 1, "DetectRefine targets the DFL-free (reg_max=1) YOLO26 head"
+#         super().__init__(nc, reg_max, end2end, ch)
+#         levels = tuple(range(len(ch))) if self.refine_levels is None else tuple(self.refine_levels)
+#         self.refine = nn.ModuleDict({
+#             str(i): TinyRefine(ch[i], self.refine_cmid, self.refine_cout,
+#                                self.refine_min_extent, self.refine_ctx)
+#             for i in levels
+#         })
+#         if end2end:
+#             self.one2one_refine = copy.deepcopy(self.refine)
 
-    @property
-    def one2many(self):
-        return dict(box_head=self.cv2, cls_head=self.cv3,
-                    refine=getattr(self, "refine", None))
+#     @property
+#     def one2many(self):
+#         return dict(box_head=self.cv2, cls_head=self.cv3,
+#                     refine=getattr(self, "refine", None))
 
-    @property
-    def one2one(self):
-        # accessing one2one_cv2 first preserves the stock hasattr(self, "one2one") trick
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3,
-                    refine=getattr(self, "one2one_refine", None))
+#     @property
+#     def one2one(self):
+#         # accessing one2one_cv2 first preserves the stock hasattr(self, "one2one") trick
+#         return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3,
+#                     refine=getattr(self, "one2one_refine", None))
 
-    def forward_head(self, x, box_head=None, cls_head=None, refine=None):
-        if box_head is None or cls_head is None:  # fused inference (one2many dropped)
-            return dict()
-        bs = x[0].shape[0]
-        boxes, scores = [], []
-        for i in range(self.nl):
-            b = box_head[i](x[i])   # (bs, 4, h, w) coarse ltrb, grid units
-            s = cls_head[i](x[i])   # (bs, nc, h, w)
-            if refine is not None and str(i) in refine:
-                db, dq = refine[str(i)](x[i], b)
-                b = b + db          # refined ltrb — coarse branch keeps its gradient
-                s = s + dq          # quality-shifted logits — fixes NMS-free top-k ranking
-            boxes.append(b.view(bs, 4 * self.reg_max, -1))
-            scores.append(s.view(bs, self.nc, -1))
-        return dict(boxes=torch.cat(boxes, -1), scores=torch.cat(scores, -1), feats=x)
+#     def forward_head(self, x, box_head=None, cls_head=None, refine=None):
+#         if box_head is None or cls_head is None:  # fused inference (one2many dropped)
+#             return dict()
+#         bs = x[0].shape[0]
+#         boxes, scores = [], []
+#         for i in range(self.nl):
+#             b = box_head[i](x[i])   # (bs, 4, h, w) coarse ltrb, grid units
+#             s = cls_head[i](x[i])   # (bs, nc, h, w)
+#             if refine is not None and str(i) in refine:
+#                 db, dq = refine[str(i)](x[i], b)
+#                 b = b + db          # refined ltrb — coarse branch keeps its gradient
+#                 s = s + dq          # quality-shifted logits — fixes NMS-free top-k ranking
+#             boxes.append(b.view(bs, 4 * self.reg_max, -1))
+#             scores.append(s.view(bs, self.nc, -1))
+#         return dict(boxes=torch.cat(boxes, -1), scores=torch.cat(scores, -1), feats=x)
 
-    def fuse(self):
-        super().fuse()        # drops one2many towers (cv2 = cv3 = None)
-        self.refine = None    # drop one2many refinement too; one2one_refine stays for inference
+#     def fuse(self):
+#         super().fuse()        # drops one2many towers (cv2 = cv3 = None)
+#         self.refine = None    # drop one2many refinement too; one2one_refine stays for inference
 
 
 
