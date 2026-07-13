@@ -512,13 +512,13 @@ class DetectionModel(BaseModel):
         y[-1] = y[-1][..., i:]  # small
         return y
 
-    def init_criterion(self):
-        """Initialize the loss criterion for the DetectionModel."""
-        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
     # def init_criterion(self):
     #     """Initialize the loss criterion for the DetectionModel."""
-    #     # Add import at top of tasks.py: from ultralytics.utils.loss import TinyE2ELoss
-    #     return TinyE2ELoss(self, use_rle=True) if getattr(self, "end2end", False) else TinyDetectionLoss(self, use_rle=True)
+    #     return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel."""
+        # Add import at top of tasks.py: from ultralytics.utils.loss import TinyE2ELoss
+        return TinyE2ELoss(self, use_rle=True) if getattr(self, "end2end", False) else TinyDetectionLoss(self, use_rle=True)
 
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
