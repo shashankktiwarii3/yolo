@@ -47,7 +47,6 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
-    DetectSigma,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -81,7 +80,6 @@ from ultralytics.utils.checks import check_requirements, check_suffix, check_yam
 from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
-    SizeDecoupledE2ELoss,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -511,13 +509,10 @@ class DetectionModel(BaseModel):
         y[-1] = y[-1][..., i:]  # small
         return y
 
-    # def init_criterion(self):
-    #     """Initialize the loss criterion for the DetectionModel."""
-    #     return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
     def init_criterion(self):
-        if isinstance(self.model[-1], DetectSigma) or getattr(self, "tiny_saga", False):
-            return SizeDecoupledE2ELoss(self, **getattr(self, "tiny_kw", {}))
+        """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
 
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
@@ -1686,7 +1681,6 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
-                DetectSigma,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
@@ -1702,7 +1696,7 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, DetectSigma, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
         elif m is v10Detect:
             args.append([ch[x] for x in f])

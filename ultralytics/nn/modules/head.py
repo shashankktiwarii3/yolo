@@ -251,69 +251,6 @@ class Detect(nn.Module):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
 
-class DetectSigma(Detect):
-    """YOLO26 Detect + per-side box-uncertainty branch (RLE-Box) + sigma-Rank.
-
-    Adds sig_head to BOTH branches, emits preds["sigma"] (b,4,A) raw logits.
-    flow_model is train-only (mirrors Pose26); dropped in fuse().
-    """
-    gamma = 0.5  # sigma-Rank strength; 0 == baseline exactly
-
-    def __init__(self, nc: int = 80, reg_max=1, end2end=True, ch: tuple = ()):
-        super().__init__(nc, reg_max, end2end, ch)
-        from .block import RealNVP  # reuse shipped flow if 4-D capable
-        c2 = max((16, ch[0] // 4, self.reg_max * 4))
-        self.cv2_sigma = nn.ModuleList(
-            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4, 1)) for x in ch)
-        for m in self.cv2_sigma:
-            nn.init.constant_(m[-1].bias, -2.0)  # sigma_0 ~ 0.12, no cold-start spike
-        if end2end:
-            self.one2one_cv2_sigma = copy.deepcopy(self.cv2_sigma)
-        try:
-            self.flow_model = RealNVP(dim=4)
-        except TypeError:
-            self.flow_model = BoxRealNVP(dim=4)  # fallback, defined below
-
-    @property
-    def one2many(self):
-        return dict(box_head=self.cv2, cls_head=self.cv3, sig_head=self.cv2_sigma)
-
-    @property
-    def one2one(self):
-        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3,
-                    sig_head=self.one2one_cv2_sigma)
-
-    def forward_head(self, x, box_head=None, cls_head=None, sig_head=None):
-        preds = Detect.forward_head(self, x, box_head, cls_head)
-        if sig_head is not None and preds:
-            bs = x[0].shape[0]
-            preds["sigma"] = torch.cat(
-                [sig_head[i](x[i]).view(bs, 4, -1) for i in range(self.nl)], dim=-1)
-        return preds
-
-    def _inference(self, x):
-        """sigma-Rank: s' = s * exp(-gamma * mean_i sigma_i/(d_i+1)), BEFORE the top-300 cut."""
-        dbox = self._get_decode_boxes(x)
-        scores = x["scores"].sigmoid()
-        if self.gamma and "sigma" in x:
-            sig = x["sigma"].sigmoid()                     # (b,4,A)
-            d = x["boxes"].clamp_min(0)                    # ltrb, stride units
-            q = torch.exp(-self.gamma * (sig / (d + 1.0)).mean(1, keepdim=True))  # (b,1,A)
-            scores = scores * q
-        return torch.cat((dbox, scores), 1)
-
-    def bias_init(self):
-        super().bias_init()
-        for m in self.cv2_sigma:
-            nn.init.constant_(m[-1].bias, -2.0)
-        if self.end2end:
-            for m in self.one2one_cv2_sigma:
-                nn.init.constant_(m[-1].bias, -2.0)
-
-    def fuse(self):
-        self.cv2 = self.cv3 = self.cv2_sigma = self.flow_model = None
-
-
 class BoxRealNVP(nn.Module):
     """4-D RealNVP over (l,t,r,b) residuals. Train-only. Fallback if block.RealNVP is 2-D-fixed."""
     class _C(nn.Module):
