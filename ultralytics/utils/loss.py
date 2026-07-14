@@ -1238,31 +1238,58 @@ class TVPSegmentLoss(TVPDetectLoss):
         return cls_loss, vp_loss[1]
 
 
+# ============================================================================
+# Tiny-object YOLO26: SAGA + RLE-Box + SD-ProgLoss
+# ============================================================================
+from .tal import SAGAAssigner  # add to the existing `from .tal import ...` line
 
-from .tal import SAGAAssigner  # add to the existing tal import line
+
+def _norm_ltrb(d, stride_tensor, imgsz):
+    """(b,a,4) ltrb in stride units -> image-normalized. Matches BboxLoss's reg_max=1 path.
+    Non-in-place: safe on tensors that require grad."""
+    d = d * stride_tensor
+    return torch.stack((d[..., 0] / imgsz[1], d[..., 1] / imgsz[0],
+                        d[..., 2] / imgsz[1], d[..., 3] / imgsz[0]), dim=-1)
 
 
 class RLEBoxLoss(nn.Module):
-    """L_RLE = sum_sides[ log(sig) - log phi(eps) + log(2 sig) + |eps| ], eps=(d_hat-d*)/sig.
-    Normalized by target_scores_sum, mirroring the box-loss reduction. fp32 under autocast."""
+    """Residual Log-Likelihood over the 4 box sides.
+
+        eps   = (d_hat - d*) / sigma                      (per side, stride units)
+        L_RLE = sum_sides[ log(sig) + log(2 sig) + |eps| ] - log phi(eps)
+                                                             \__ joint 4D flow __/
+
+    Replaces the L1 point-estimate regression loss that YOLO26 substituted for DFL
+    (BboxLoss, reg_max=1 branch) -- same loss slot, same `dfl` gain (1.5).
+    The flow is OWNED BY THE HEAD (head.flow_model), so it lands in the optimizer,
+    the checkpoint, and MuSGD's matrix group -- exactly like Pose26's RLE flow.
+    fp32 under autocast.
+    """
 
     def __init__(self, flow):
         super().__init__()
-        self.flow = flow  # owned by the HEAD (so it lands in the optimizer + checkpoint)
+        self.flow = flow
 
     def forward(self, pred_ltrb, pred_sigma, target_ltrb, weight, tss):
         with autocast(enabled=False):
-            p, s, t = pred_ltrb.float(), pred_sigma.float().clamp(1e-4, 1.0), target_ltrb.float()
-            eps = ((p - t) / s).clamp(-100, 100)
-            log_phi = self.flow.log_prob(eps)
+            p = pred_ltrb.float()
+            s = pred_sigma.float().clamp(1e-4, 1.0)
+            t = target_ltrb.float()
+            eps = ((p - t) / s).clamp(-100, 100)             # (F,4)
+            log_phi = self.flow.log_prob(eps)                # (F,)
             nll = s.log().sum(-1) - log_phi + ((2 * s).log() + eps.abs()).sum(-1)
             loss = (nll * weight.float().squeeze(-1)).sum() / tss.float().clamp_min(1)
         return loss.to(pred_ltrb.dtype)
 
 
 class TinyDetectionLoss(v8DetectionLoss):
-    """v8DetectionLoss + SAGA assigner + RLE-Box + tiny/rest loss split.
-    Returns (loss_rest, loss_tiny, items); each is (box, cls, rle)."""
+    """Single-branch loss: SAGA assigner + (RLE-Box | stock L1) + tiny/rest split.
+
+    Returns (loss_rest, loss_tiny, items); each loss vec is (box, cls, reg) * bs.
+    `reg` is RLE-Box when use_rle=True, else the stock image-normalized L1 --
+    so use_rle=False + gate_tau=-1e9 + guarantee=False reduces EXACTLY to
+    v8DetectionLoss (invariant 2).
+    """
 
     def __init__(self, model, tal_topk=10, tal_topk2=None,
                  saga_kw=None, use_rle=True, lambda_rle=None, tiny_tau=24.0):
@@ -1271,16 +1298,17 @@ class TinyDetectionLoss(v8DetectionLoss):
         self.assigner = SAGAAssigner(
             topk=tal_topk, topk2=tal_topk2, num_classes=self.nc, alpha=0.5, beta=6.0,
             stride=self.stride.tolist(), **(saga_kw or {}))
-        self.use_rle = use_rle and hasattr(m, "flow_model") and m.flow_model is not None
+        self.use_rle = bool(use_rle) and getattr(m, "flow_model", None) is not None
         self.rle = RLEBoxLoss(m.flow_model) if self.use_rle else None
-        self.lambda_rle = self.hyp.dfl if lambda_rle is None else lambda_rle  # the vacated 1.5 slot
+        self.lambda_rle = self.hyp.dfl if lambda_rle is None else lambda_rle  # 1.5, the reg slot
         self.tiny_tau = tiny_tau
 
     def loss(self, preds, batch):
         bs = preds["boxes"].shape[0]
-        dev, dt = self.device, preds["scores"].dtype
+        dev = self.device
         pred_distri = preds["boxes"].permute(0, 2, 1).contiguous()      # (b,a,4) ltrb, stride units
-        pred_scores = preds["scores"].permute(0, 2, 1).contiguous()
+        pred_scores = preds["scores"].permute(0, 2, 1).contiguous()     # (b,a,nc)
+        dt = pred_scores.dtype
         pred_sig = preds["sigma"].permute(0, 2, 1).contiguous().sigmoid() if self.use_rle else None
 
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
@@ -1300,55 +1328,85 @@ class TinyDetectionLoss(v8DetectionLoss):
             anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt)
         tss = max(target_scores.sum(), 1)
 
-        # tiny / rest anchor partition (px)
+        # ---- tiny / rest anchor partition (responsible-GT size, px)
         tb = target_bboxes
-        tsz = ((tb[..., 2] - tb[..., 0]).clamp_min(0) * (tb[..., 3] - tb[..., 1]).clamp_min(0)).clamp_min(1e-9).sqrt()
+        tsz = ((tb[..., 2] - tb[..., 0]).clamp_min(0)
+               * (tb[..., 3] - tb[..., 1]).clamp_min(0)).clamp_min(1e-9).sqrt()
         tiny = fg_mask & (tsz < self.tiny_tau)
         rest = fg_mask & ~tiny
 
+        # ---- cls: elementwise BCE, split by responsible-GT size (background -> rest)
         bce = self.bce(pred_scores, target_scores.to(dt))               # (b,a,nc)
-        cls_tiny = bce[tiny].sum() / tss
-        cls_rest = (bce.sum() - bce[tiny].sum()) / tss                  # bg -> rest
+        bce_tiny = bce[tiny].sum()
+        cls_tiny = bce_tiny / tss
+        cls_rest = (bce.sum() - bce_tiny) / tss
 
-        zero = pred_distri.sum() * 0.0
-        box_t = box_r = rle_t = rle_r = zero
+        # ---- DDP-safe zero fallbacks (find_unused_parameters=True is on, but be explicit)
+        zero = pred_distri.sum() * 0.0                                  # touches box head
+        zero_reg = zero
         if self.use_rle:
-            zero_rle = zero + pred_sig.sum() * 0.0 + \
-                       sum(p.sum() for p in self.rle.flow.parameters()) * 0.0
-            rle_t = rle_r = zero_rle
+            zero_reg = (zero + pred_sig.sum() * 0.0
+                        + sum(p.sum() for p in self.rle.flow.parameters()) * 0.0)
+        box_t = box_r = zero
+        reg_t = reg_r = zero_reg
 
         if fg_mask.any():
-            tbox = target_bboxes / stride_tensor
-            w = target_scores.sum(-1, keepdim=True)
+            tbox = target_bboxes / stride_tensor                        # grid units
+            w = target_scores.sum(-1, keepdim=True)                     # (b,a,1)
+
             def _box(m):
-                if not m.any(): return zero
+                if not m.any():
+                    return zero
                 iou = bbox_iou(pred_bboxes[m], tbox[m], xywh=False, CIoU=True)
                 return ((1.0 - iou) * w[m]).sum() / tss
+
             box_t, box_r = _box(tiny), _box(rest)
-            if self.use_rle:
-                tgt = bbox2dist(anchor_points, tbox)                    # unclipped ltrb
-                def _rle(m):
-                    if not m.any(): return zero_rle
-                    return self.rle(pred_distri[m], pred_sig[m], tgt[m], w[m], tss)
-                rle_t, rle_r = _rle(tiny), _rle(rest)
+
+            tgt_ltrb = bbox2dist(anchor_points, tbox)                   # unclipped ltrb, stride units
+            if self.use_rle:                                            # RLE-Box replaces L1
+                def _reg(m):
+                    if not m.any():
+                        return zero_reg
+                    return self.rle(pred_distri[m], pred_sig[m], tgt_ltrb[m], w[m], tss)
+            else:                                                       # stock reg_max=1 L1
+                pd_n = _norm_ltrb(pred_distri, stride_tensor, imgsz)
+                tg_n = _norm_ltrb(tgt_ltrb, stride_tensor, imgsz)
+
+                def _reg(m):
+                    if not m.any():
+                        return zero
+                    return (F.l1_loss(pd_n[m], tg_n[m], reduction="none").mean(-1, keepdim=True)
+                            * w[m]).sum() / tss
+
+            reg_t, reg_r = _reg(tiny), _reg(rest)
 
         gb, gc, gr = self.hyp.box, self.hyp.cls, self.lambda_rle
-        l_rest = torch.stack((box_r * gb, cls_rest * gc, rle_r * gr))
-        l_tiny = torch.stack((box_t * gb, cls_tiny * gc, rle_t * gr))
+        l_rest = torch.stack((box_r * gb, cls_rest * gc, reg_r * gr))
+        l_tiny = torch.stack((box_t * gb, cls_tiny * gc, reg_t * gr))
         return l_rest * bs, l_tiny * bs, (l_rest + l_tiny).detach()
 
 
 class SizeDecoupledE2ELoss(E2ELoss):
-    """ProgLoss with a size-conditional schedule. Mirrors the installed decay()/update() exactly.
-    o2m_w1_tiny == final_o2m  =>  bit-identical to stock ProgLoss."""
+    """ProgLoss with a SIZE-CONDITIONAL schedule (Proposal 3a).
+
+        L = a(t)*L_o2m^rest + a_T(t)*L_o2m^tiny
+          + (1-a(t))*L_o2o^rest + (1-a_T(t))*L_o2o^tiny
+
+    a(t) is the installed decay (0.8 -> final_o2m=0.1); a_T(t) decays to
+    final_o2m_tiny (0.3) -- slower, because tiny one-to-one alignment matures
+    later. Annealed by trainer's `criterion.update()` once per epoch (see
+    BaseTrainer._do_train), so this is DDP-safe with no callbacks.
+
+    INVARIANT: final_o2m_tiny == final_o2m  =>  identical to stock ProgLoss.
+    """
 
     def __init__(self, model, saga_kw=None, use_rle=True, lambda_rle=None,
                  tiny_tau=24.0, final_o2m_tiny=0.3):
-        mk = lambda k, k2: TinyDetectionLoss(model, tal_topk=k, tal_topk2=k2, saga_kw=saga_kw,
-                                             use_rle=use_rle, lambda_rle=lambda_rle, tiny_tau=tiny_tau)
-        self.one2many = mk(10, None)
-        self.one2one = mk(7, 1)
-        self.updates, self.total = 0, 1.0
+        kw = dict(saga_kw=saga_kw, use_rle=use_rle, lambda_rle=lambda_rle, tiny_tau=tiny_tau)
+        self.one2many = TinyDetectionLoss(model, tal_topk=10, tal_topk2=None, **kw)
+        self.one2one = TinyDetectionLoss(model, tal_topk=7, tal_topk2=1, **kw)
+        self.updates = 0
+        self.total = 1.0
         self.o2m = self.o2m_copy = 0.8
         self.o2o = self.total - self.o2m
         self.final_o2m = 0.1
@@ -1357,6 +1415,7 @@ class SizeDecoupledE2ELoss(E2ELoss):
         self.o2o_t = self.total - self.o2m_t
 
     def _decay(self, x, final):
+        """Exact shape of the installed E2ELoss.decay(), parameterized by the final gain."""
         return max(1 - x / max(self.one2one.hyp.epochs - 1, 1), 0) * (self.o2m_copy - final) + final
 
     def decay(self, x):
@@ -1371,8 +1430,8 @@ class SizeDecoupledE2ELoss(E2ELoss):
 
     def __call__(self, preds, batch):
         preds = self.one2many.parse_output(preds)
-        m_r, m_t, m_i = self.one2many.loss(preds["one2many"], batch)
+        m_r, m_t, _ = self.one2many.loss(preds["one2many"], batch)
         o_r, o_t, o_i = self.one2one.loss(preds["one2one"], batch)
         total = (self.o2m * m_r + self.o2m_t * m_t
                  + self.o2o * o_r + self.o2o_t * o_t)
-        return total, o_i   # items stays length-3 -> box/cls/dfl logging columns still work
+        return total, o_i     # length-3 -> box/cls/dfl logging columns unchanged
