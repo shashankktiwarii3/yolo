@@ -2105,17 +2105,13 @@ class SARFE(nn.Module):
     """Scale-Adaptive Receptive Field Enhancement for tiny object detection.
     
     Multi-branch dilated convolution block that synthesizes multiple receptive field
-    scales to align with tiny object distributions, grounded in RFLA theory.
+    scales to align with tiny object distributions. Handles channel mismatch via
+    1x1 convolution in the residual path.
     
     Args:
         c1 (int): Input channels.
         c2 (int): Output channels.
         dilations (tuple): Dilation rates for multi-scale receptive fields.
-    
-    Attributes:
-        branches (nn.ModuleList): Parallel dilated convolution branches.
-        local (nn.Sequential): Local detail branch with depthwise convolution.
-        fuse (Conv): Fusion convolution.
     """
     
     def __init__(self, c1: int, c2: int, dilations: tuple = (1, 2, 4)):
@@ -2137,10 +2133,13 @@ class SARFE(nn.Module):
             Conv(c_branch, c_branch, 1)
         )
         
-        # Fusion with residual connection
+        # Fusion convolution
         self.fuse = Conv(c2, c2, 1)
+        
+        # Residual connection: use 1x1 Conv to match channels if c1 != c2
+        self.residual = Conv(c1, c2, 1, act=False) if c1 != c2 else nn.Identity()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with multi-scale receptive field synthesis."""
         out = torch.cat([b(x) for b in self.branches] + [self.local(x)], dim=1)
-        return self.fuse(out) + x  # residual
+        return self.fuse(out) + self.residual(x)  # residual with channel matching
