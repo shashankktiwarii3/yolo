@@ -491,3 +491,120 @@ def rbox2dist(
         dist = dist.clamp_(0, reg_max - 0.01)
 
     return dist
+
+
+# ============================== SAGA ==============================
+class SAGAAssigner(TaskAlignedAssigner):
+    """Scale-Adaptive Gaussian Alignment. Drop-in TAL for BOTH YOLO26 heads.
+
+    o2m: SAGAAssigner(topk=10, topk2=None)   o2o: SAGAAssigner(topk=7, topk2=1)
+    Only get_pos_mask() is overridden; forward/_forward/select_highest_overlaps
+    (incl. the topk2 filter) are the installed parent's.
+    """
+
+    def __init__(self, topk=10, num_classes=80, alpha=0.5, beta=6.0,
+                 stride=[8, 16, 32], eps=1e-9, topk2=None,
+                 gate_tau=24.0, gate_temp=4.0, erf_k=1.0, cand_topk=12,
+                 metric="kld", nwd_C=12.8, kld_dir="gt2anchor",
+                 guarantee=True, stal=True):
+        super().__init__(topk=topk, num_classes=num_classes, alpha=alpha, beta=beta,
+                         stride=stride, eps=eps, topk2=topk2)
+        self.gate_tau, self.gate_temp = gate_tau, gate_temp
+        self.erf_k, self.cand_topk = erf_k, cand_topk
+        self.metric, self.nwd_C, self.kld_dir = metric, nwd_C, kld_dir
+        self.guarantee, self.stal = guarantee, stal
+        self._anc_strides = None
+
+    def set_anchor_strides(self, stride_tensor):
+        """Called by TinyDetectionLoss every step with make_anchors()'s stride_tensor."""
+        self._anc_strides = stride_tensor
+
+    # --- row-1 ablation: disable the installed STAL box inflation ---
+    def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt, eps=1e-9):
+        if self.stal:
+            return super().select_candidates_in_gts(xy_centers, gt_bboxes, mask_gt, eps)
+        n_anchors = xy_centers.shape[0]
+        bs, n_boxes, _ = gt_bboxes.shape
+        lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)
+        d = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=2).view(bs, n_boxes, n_anchors, -1)
+        return d.amin(3).gt_(eps)
+
+    # --- gaussian machinery ---
+    def _tiny_gate(self, gt_bboxes):
+        w = (gt_bboxes[..., 2] - gt_bboxes[..., 0]).clamp_min(0)
+        h = (gt_bboxes[..., 3] - gt_bboxes[..., 1]).clamp_min(0)
+        size = (w * h).clamp_min(self.eps).sqrt()
+        return torch.sigmoid((self.gate_tau - size) / max(self.gate_temp, 1e-6))  # (b,n)
+
+    def _gauss_sim(self, gt_bboxes, anc_points):
+        assert self._anc_strides is not None, "call assigner.set_anchor_strides(stride_tensor) first"
+        with torch.autocast(device_type=gt_bboxes.device.type, enabled=False):
+            g = gt_bboxes.float()
+            mu_g = torch.stack(((g[..., 0] + g[..., 2]) * .5, (g[..., 1] + g[..., 3]) * .5), -1).unsqueeze(2)
+            s_g = torch.stack(((g[..., 2] - g[..., 0]).clamp_min(self.eps) * .5,
+                               (g[..., 3] - g[..., 1]).clamp_min(self.eps) * .5), -1).unsqueeze(2)  # (b,n,1,2)
+            mu_a = anc_points.float().view(1, 1, -1, 2)
+            r = (self.erf_k * self._anc_strides.float()).view(1, 1, -1, 1)
+            s_a = r.expand(-1, -1, -1, 2)
+            if self.metric == "nwd":
+                w2 = (mu_g - mu_a).pow(2).sum(-1) + (s_g - s_a).pow(2).sum(-1)
+                sim = torch.exp(-w2.clamp_min(0).sqrt() / max(self.nwd_C, 1e-6))
+            else:
+                (m1, v1), (m2, v2) = ((mu_g, s_g.pow(2)), (mu_a, s_a.pow(2))) \
+                    if self.kld_dir == "gt2anchor" else ((mu_a, s_a.pow(2)), (mu_g, s_g.pow(2)))
+                v1, v2 = v1.clamp_min(self.eps), v2.clamp_min(self.eps)
+                kld = .5 * ((v1 / v2).sum(-1) + ((m2 - m1).pow(2) / v2).sum(-1) - 2.
+                            + (v2.log() - v1.log()).sum(-1))
+                sim = 1. / (1. + kld)
+        return sim.to(gt_bboxes.dtype)  # (b,n,a)
+
+    @staticmethod
+    def _masked_topk_bool(metrics, k, valid):
+        m = metrics.masked_fill(~valid, -float("inf"))
+        k = min(k, metrics.shape[-1])
+        idx = m.topk(k, dim=-1).indices
+        out = torch.zeros_like(metrics, dtype=torch.bool)
+        out.scatter_(-1, idx, True)
+        return out & valid
+
+    def _fused_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, pool, gsim, gate):
+        b, n, a = pool.shape
+        u_iou = torch.zeros_like(gsim)
+        scores = torch.zeros_like(gsim)
+        if pool.any():
+            ib = torch.arange(b, device=pd_scores.device).view(-1, 1).expand(-1, n)
+            lbl = gt_labels.long().squeeze(-1)
+            scores[pool] = pd_scores[ib, :, lbl][pool]
+            gt_e = gt_bboxes.unsqueeze(2).expand(-1, -1, a, -1)[pool]
+            pd_e = pd_bboxes.unsqueeze(1).expand(-1, n, -1, -1)[pool]
+            u_iou[pool] = self.iou_calculation(gt_e, pd_e)
+        g = gate.unsqueeze(-1)
+        u_star = (g * gsim + (1. - g) * u_iou).clamp(0, 1) * pool
+        align = scores.clamp_min(self.eps).pow(self.alpha) * u_star.clamp_min(self.eps).pow(self.beta)
+        return align * pool, u_star
+
+    def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
+        mgt = mask_gt.bool()                                # (b,n,1)
+        mask_in = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt).bool()
+        gsim = self._gauss_sim(gt_bboxes, anc_points)       # (b,n,a)
+        gate = self._tiny_gate(gt_bboxes)                   # (b,n)
+        is_tiny = (gate > 0.5) & mgt.squeeze(-1)
+
+        valid = mgt.expand_as(gsim)
+        pool_tiny = self._masked_topk_bool(gsim, self.cand_topk, valid)
+        pool = torch.where(is_tiny.unsqueeze(-1), pool_tiny | mask_in, mask_in) & valid
+
+        align, u_star = self._fused_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes,
+                                            pool, gsim, gate)
+
+        # exact parity with the installed top-k (same dup-collision guard)
+        mask_topk = self.select_topk_candidates(
+            align, topk_mask=mask_gt.expand(-1, -1, self.topk).bool()).bool()
+        mask_pos = mask_topk & pool
+
+        if self.guarantee:  # zero-positive fix: best-similarity anchor of every tiny GT is positive
+            best = gsim.masked_fill(~valid, -float("inf")).argmax(-1, keepdim=True)
+            forced = torch.zeros_like(mask_pos).scatter_(-1, best, True)
+            mask_pos = mask_pos | (forced & is_tiny.unsqueeze(-1))
+
+        return mask_pos.to(align.dtype), align, u_star

@@ -251,6 +251,99 @@ class Detect(nn.Module):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
 
+class DetectSigma(Detect):
+    """YOLO26 Detect + per-side box-uncertainty branch (RLE-Box) + sigma-Rank.
+
+    Adds sig_head to BOTH branches, emits preds["sigma"] (b,4,A) raw logits.
+    flow_model is train-only (mirrors Pose26); dropped in fuse().
+    """
+    gamma = 0.5  # sigma-Rank strength; 0 == baseline exactly
+
+    def __init__(self, nc: int = 80, reg_max=1, end2end=True, ch: tuple = ()):
+        super().__init__(nc, reg_max, end2end, ch)
+        from .block import RealNVP  # reuse shipped flow if 4-D capable
+        c2 = max((16, ch[0] // 4, self.reg_max * 4))
+        self.cv2_sigma = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4, 1)) for x in ch)
+        for m in self.cv2_sigma:
+            nn.init.constant_(m[-1].bias, -2.0)  # sigma_0 ~ 0.12, no cold-start spike
+        if end2end:
+            self.one2one_cv2_sigma = copy.deepcopy(self.cv2_sigma)
+        try:
+            self.flow_model = RealNVP(dim=4)
+        except TypeError:
+            self.flow_model = BoxRealNVP(dim=4)  # fallback, defined below
+
+    @property
+    def one2many(self):
+        return dict(box_head=self.cv2, cls_head=self.cv3, sig_head=self.cv2_sigma)
+
+    @property
+    def one2one(self):
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3,
+                    sig_head=self.one2one_cv2_sigma)
+
+    def forward_head(self, x, box_head=None, cls_head=None, sig_head=None):
+        preds = Detect.forward_head(self, x, box_head, cls_head)
+        if sig_head is not None and preds:
+            bs = x[0].shape[0]
+            preds["sigma"] = torch.cat(
+                [sig_head[i](x[i]).view(bs, 4, -1) for i in range(self.nl)], dim=-1)
+        return preds
+
+    def _inference(self, x):
+        """sigma-Rank: s' = s * exp(-gamma * mean_i sigma_i/(d_i+1)), BEFORE the top-300 cut."""
+        dbox = self._get_decode_boxes(x)
+        scores = x["scores"].sigmoid()
+        if self.gamma and "sigma" in x:
+            sig = x["sigma"].sigmoid()                     # (b,4,A)
+            d = x["boxes"].clamp_min(0)                    # ltrb, stride units
+            q = torch.exp(-self.gamma * (sig / (d + 1.0)).mean(1, keepdim=True))  # (b,1,A)
+            scores = scores * q
+        return torch.cat((dbox, scores), 1)
+
+    def bias_init(self):
+        super().bias_init()
+        for m in self.cv2_sigma:
+            nn.init.constant_(m[-1].bias, -2.0)
+        if self.end2end:
+            for m in self.one2one_cv2_sigma:
+                nn.init.constant_(m[-1].bias, -2.0)
+
+    def fuse(self):
+        self.cv2 = self.cv3 = self.cv2_sigma = self.flow_model = None
+
+
+class BoxRealNVP(nn.Module):
+    """4-D RealNVP over (l,t,r,b) residuals. Train-only. Fallback if block.RealNVP is 2-D-fixed."""
+    class _C(nn.Module):
+        def __init__(self, dim, mask, hidden=64):
+            super().__init__()
+            self.register_buffer("mask", mask.float())
+            self.s = nn.Sequential(nn.Linear(dim, hidden), nn.LeakyReLU(.1),
+                                   nn.Linear(hidden, hidden), nn.LeakyReLU(.1),
+                                   nn.Linear(hidden, dim), nn.Tanh())
+            self.t = nn.Sequential(nn.Linear(dim, hidden), nn.LeakyReLU(.1),
+                                   nn.Linear(hidden, hidden), nn.LeakyReLU(.1),
+                                   nn.Linear(hidden, dim))
+        def forward(self, x):
+            xm = x * self.mask
+            s = self.s(xm) * (1 - self.mask)
+            t = self.t(xm) * (1 - self.mask)
+            return xm + (1 - self.mask) * (x * torch.exp(s) + t), s.sum(-1)
+
+    def __init__(self, dim=4, n_pairs=3, hidden=64):
+        super().__init__()
+        m = torch.zeros(dim); m[: dim // 2] = 1.0
+        self.layers = nn.ModuleList(
+            self._C(dim, m if i % 2 == 0 else 1 - m, hidden) for i in range(2 * n_pairs))
+        self.dim = dim
+
+    def log_prob(self, x):
+        z, ld = x, torch.zeros(x.shape[:-1], device=x.device, dtype=x.dtype)
+        for l in self.layers:
+            z, d = l(z); ld = ld + d
+        return -0.5 * (z.pow(2).sum(-1) + self.dim * math.log(2 * math.pi)) + ld
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
