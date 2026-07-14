@@ -355,42 +355,43 @@ class TaskAlignedAssigner(nn.Module):
     #     return target_gt_idx, fg_mask, mask_pos
     # Modify the select_candidates_in_gts method in TaskAlignedAssigner
 
-    def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt, eps=1e-9):
-        """Select positive anchor centers using Receptive Field Distance (RFD).
-        
-        Replaces STAL's binary clamp with continuous Gaussian receptive field
-        alignment, providing smooth assignment for tiny objects.
-        """
-        # Convert to xywh for scale computation
-        gt_bboxes_xywh = xyxy2xywh(gt_bboxes)
-        gt_centers = gt_bboxes_xywh[..., :2]  # (b, n_boxes, 2)
-        gt_wh = gt_bboxes_xywh[..., 2:]       # (b, n_boxes, 2)
-        
-        # Effective receptive field radius at this pyramid level
-        # Based on the backbone's theoretical receptive field
-        rf_radius = self.stride_val * 4  # heuristic: 4x stride
-        
-        # Compute Receptive Field Distance (RFD)
-        # Model both GT and anchor as 2D Gaussians
-        # For simplicity, use Euclidean distance normalized by RF radius
-        dist = ((xy_centers[None, None] - gt_centers[:, :, None]) ** 2).sum(-1)  # (b, n_boxes, h*w)
-        
-        # Gaussian decay: closer anchors get higher alignment scores
-        rfd = torch.exp(-dist / (2 * (rf_radius / 2) ** 2))
-        
-        # Scale-aware adjustment: tiny objects get expanded candidate region
-        gt_scale = (gt_wh.prod(dim=-1) + 1e-9).sqrt()  # (b, n_boxes)
-        scale_factor = torch.clamp(self.stride_val / (gt_scale + 1e-9), 1.0, 4.0)  # expand for tiny objects
-        
-        # Adjusted mask: continuous threshold with scale awareness
-        threshold = 0.5 / scale_factor.unsqueeze(-1)  # lower threshold for tiny objects
-        mask = rfd > threshold
-        
-        # REMOVED: mask = mask & mask_gt.squeeze(-1).bool()
-        # mask_gt is applied automatically in get_pos_mask() later
-        
-        return mask
+    def select_highest_overlaps(self, mask_pos, overlaps, n_max_boxes, align_metric):
+        """Select anchor boxes with highest IoU when assigned to multiple ground truths.
 
+        Args:
+            mask_pos (torch.Tensor): Positive mask, shape (b, n_max_boxes, h*w).
+            overlaps (torch.Tensor): IoU overlaps, shape (b, n_max_boxes, h*w).
+            n_max_boxes (int): Maximum number of ground truth boxes.
+            align_metric (torch.Tensor): Alignment metric for selecting best matches.
+
+        Returns:
+            target_gt_idx (torch.Tensor): Indices of assigned ground truths, shape (b, h*w).
+            fg_mask (torch.Tensor): Foreground mask, shape (b, h*w).
+            mask_pos (torch.Tensor): Updated positive mask, shape (b, n_max_boxes, h*w).
+        """
+        # Convert (b, n_max_boxes, h*w) -> (b, h*w)
+        fg_mask = mask_pos.sum(-2)
+        if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes
+            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)  # (b, n_max_boxes, h*w)
+
+            max_overlaps_idx = overlaps.argmax(1)  # (b, h*w)
+            is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
+            is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
+            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()  # (b, n_max_boxes, h*w)
+
+            fg_mask = mask_pos.sum(-2)
+
+        if self.topk2 != self.topk:
+            align_metric = align_metric * mask_pos  # update overlaps
+            max_overlaps_idx = torch.topk(align_metric, self.topk2, dim=-1, largest=True).indices  # (b, n_max_boxes)
+            topk_idx = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)  # update mask_pos
+            topk_idx.scatter_(-1, max_overlaps_idx, 1.0)
+            mask_pos *= topk_idx
+            fg_mask = mask_pos.sum(-2)
+            
+        # Find each grid serve which gt(index)
+        target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
+        return target_gt_idx, fg_mask, mask_pos
 
 class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
     """Assigns ground-truth objects to rotated bounding boxes using a task-aligned metric."""
