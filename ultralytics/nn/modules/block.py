@@ -2098,3 +2098,49 @@ class HighFreqInject(nn.Module):
             self._dbg_printed = True
     
         return target + projected
+
+# Add this class to block.py
+
+class SARFE(nn.Module):
+    """Scale-Adaptive Receptive Field Enhancement for tiny object detection.
+    
+    Multi-branch dilated convolution block that synthesizes multiple receptive field
+    scales to align with tiny object distributions, grounded in RFLA theory.
+    
+    Args:
+        c1 (int): Input channels.
+        c2 (int): Output channels.
+        dilations (tuple): Dilation rates for multi-scale receptive fields.
+    
+    Attributes:
+        branches (nn.ModuleList): Parallel dilated convolution branches.
+        local (nn.Sequential): Local detail branch with depthwise convolution.
+        fuse (Conv): Fusion convolution.
+    """
+    
+    def __init__(self, c1: int, c2: int, dilations: tuple = (1, 2, 4)):
+        super().__init__()
+        c_branch = c2 // (len(dilations) + 1)  # +1 for local branch
+        
+        # Multi-scale dilated branches for receptive field alignment
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                Conv(c1, c_branch, 1),
+                Conv(c_branch, c_branch, 3, d=d)
+            ) for d in dilations
+        ])
+        
+        # Local detail branch (preserves fine-grained information)
+        self.local = nn.Sequential(
+            Conv(c1, c_branch, 1),
+            DWConv(c_branch, c_branch, 5),
+            Conv(c_branch, c_branch, 1)
+        )
+        
+        # Fusion with residual connection
+        self.fuse = Conv(c2, c2, 1)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with multi-scale receptive field synthesis."""
+        out = torch.cat([b(x) for b in self.branches] + [self.local(x)], dim=1)
+        return self.fuse(out) + x  # residual
