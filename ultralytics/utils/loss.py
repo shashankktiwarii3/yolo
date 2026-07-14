@@ -19,97 +19,6 @@ from .tal import bbox2dist, rbox2dist
 
 # Add this class to loss.py
 
-class GSARBboxLoss(BboxLoss):
-    """Gaussian-Scale-Adaptive Regression Loss for tiny object detection.
-    
-    Combines Inner-IoU with adaptive ratio and L1 loss, with scale-dependent
-    gradient amplification for tiny objects.
-    
-    Args:
-        reg_max (int): Maximum regression value for DFL.
-    """
-    
-    def __init__(self, reg_max: int = 16):
-        super().__init__(reg_max)
-        # Running estimate of object scale (for adaptive normalization)
-        self.register_buffer('scale_median', torch.tensor(10.0))
-        self.register_buffer('scale_std', torch.tensor(5.0))
-        self.momentum = 0.1
-        
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes,
-                target_scores, target_scores_sum, fg_mask, imgsz, stride):
-        """Compute GSAR loss with scale-adaptive gradient weighting."""
-        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        
-        # === Standard IoU loss ===
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-        
-        # === Inner-IoU with adaptive ratio ===
-        # Compute object scales
-        gt_wh = (target_bboxes[fg_mask][..., 2:] - target_bboxes[fg_mask][..., :2])
-        gt_scale = (gt_wh.prod(dim=-1) + 1e-9).sqrt()
-        
-        # Update running scale statistics
-        with torch.no_grad():
-            batch_median = gt_scale.median()
-            batch_std = gt_scale.std() + 1e-6
-            self.scale_median.mul_(1 - self.momentum).add_(batch_median * self.momentum)
-            self.scale_std.mul_(1 - self.momentum).add_(batch_std * self.momentum)
-        
-        # Adaptive ratio: smaller for tiny objects (amplifies gradient)
-        r = torch.clamp(
-            0.35 + 0.4 * torch.sigmoid(
-                (gt_scale - self.scale_median) / (self.scale_std + 1e-9)
-            ),
-            0.2, 0.7
-        )
-        
-        # Create auxiliary boxes for Inner-IoU
-        pred_centers = (pred_bboxes[fg_mask][..., :2] + pred_bboxes[fg_mask][..., 2:]) / 2
-        gt_centers = (target_bboxes[fg_mask][..., :2] + target_bboxes[fg_mask][..., 2:]) / 2
-        
-        pred_inner = torch.cat([
-            pred_centers - (pred_centers - pred_bboxes[fg_mask][..., :2]) * r.unsqueeze(-1),
-            pred_centers + (pred_bboxes[fg_mask][..., 2:] - pred_centers) * r.unsqueeze(-1)
-        ], dim=-1)
-        
-        gt_inner = torch.cat([
-            gt_centers - (gt_centers - target_bboxes[fg_mask][..., :2]) * r.unsqueeze(-1),
-            gt_centers + (target_bboxes[fg_mask][..., 2:] - gt_centers) * r.unsqueeze(-1)
-        ], dim=-1)
-        
-        inner_iou = bbox_iou(pred_inner, gt_inner, xywh=False, CIoU=True)
-        loss_inner = ((1.0 - inner_iou) * weight).sum() / target_scores_sum
-        
-        # Scale-dependent gate: tiny objects get more Inner-IoU weight
-        gamma = torch.exp(-gt_scale / (self.scale_median + 1e-9)).mean()
-        loss_iou = loss_iou * (1 - gamma) + loss_inner * gamma
-        
-        # === L1/DFL loss (same as original) ===
-        if self.dfl_loss:
-            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
-            loss_dfl = self.dfl_loss(
-                pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), 
-                target_ltrb[fg_mask]
-            ) * weight
-            loss_dfl = loss_dfl.sum() / target_scores_sum
-        else:
-            target_ltrb = bbox2dist(anchor_points, target_bboxes)
-            target_ltrb = target_ltrb * stride
-            target_ltrb[..., 0::2] /= imgsz[1]
-            target_ltrb[..., 1::2] /= imgsz[0]
-            pred_dist = pred_dist * stride
-            pred_dist[..., 0::2] /= imgsz[1]
-            pred_dist[..., 1::2] /= imgsz[0]
-            loss_dfl = (
-                F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none")
-                .mean(-1, keepdim=True) * weight
-            )
-            loss_dfl = loss_dfl.sum() / target_scores_sum
-        
-        return loss_iou, loss_dfl
-    
 
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
@@ -421,6 +330,98 @@ class KeypointLoss(nn.Module):
         # e = d / (2 * (area * self.sigmas) ** 2 + 1e-9)  # from formula
         e = d / ((2 * self.sigmas).pow(2) * (area + 1e-9) * 2)  # from cocoeval
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
+
+class GSARBboxLoss(BboxLoss):
+    """Gaussian-Scale-Adaptive Regression Loss for tiny object detection.
+    
+    Combines Inner-IoU with adaptive ratio and L1 loss, with scale-dependent
+    gradient amplification for tiny objects.
+    
+    Args:
+        reg_max (int): Maximum regression value for DFL.
+    """
+    
+    def __init__(self, reg_max: int = 16):
+        super().__init__(reg_max)
+        # Running estimate of object scale (for adaptive normalization)
+        self.register_buffer('scale_median', torch.tensor(10.0))
+        self.register_buffer('scale_std', torch.tensor(5.0))
+        self.momentum = 0.1
+        
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes,
+                target_scores, target_scores_sum, fg_mask, imgsz, stride):
+        """Compute GSAR loss with scale-adaptive gradient weighting."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # === Standard IoU loss ===
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        
+        # === Inner-IoU with adaptive ratio ===
+        # Compute object scales
+        gt_wh = (target_bboxes[fg_mask][..., 2:] - target_bboxes[fg_mask][..., :2])
+        gt_scale = (gt_wh.prod(dim=-1) + 1e-9).sqrt()
+        
+        # Update running scale statistics
+        with torch.no_grad():
+            batch_median = gt_scale.median()
+            batch_std = gt_scale.std() + 1e-6
+            self.scale_median.mul_(1 - self.momentum).add_(batch_median * self.momentum)
+            self.scale_std.mul_(1 - self.momentum).add_(batch_std * self.momentum)
+        
+        # Adaptive ratio: smaller for tiny objects (amplifies gradient)
+        r = torch.clamp(
+            0.35 + 0.4 * torch.sigmoid(
+                (gt_scale - self.scale_median) / (self.scale_std + 1e-9)
+            ),
+            0.2, 0.7
+        )
+        
+        # Create auxiliary boxes for Inner-IoU
+        pred_centers = (pred_bboxes[fg_mask][..., :2] + pred_bboxes[fg_mask][..., 2:]) / 2
+        gt_centers = (target_bboxes[fg_mask][..., :2] + target_bboxes[fg_mask][..., 2:]) / 2
+        
+        pred_inner = torch.cat([
+            pred_centers - (pred_centers - pred_bboxes[fg_mask][..., :2]) * r.unsqueeze(-1),
+            pred_centers + (pred_bboxes[fg_mask][..., 2:] - pred_centers) * r.unsqueeze(-1)
+        ], dim=-1)
+        
+        gt_inner = torch.cat([
+            gt_centers - (gt_centers - target_bboxes[fg_mask][..., :2]) * r.unsqueeze(-1),
+            gt_centers + (target_bboxes[fg_mask][..., 2:] - gt_centers) * r.unsqueeze(-1)
+        ], dim=-1)
+        
+        inner_iou = bbox_iou(pred_inner, gt_inner, xywh=False, CIoU=True)
+        loss_inner = ((1.0 - inner_iou) * weight).sum() / target_scores_sum
+        
+        # Scale-dependent gate: tiny objects get more Inner-IoU weight
+        gamma = torch.exp(-gt_scale / (self.scale_median + 1e-9)).mean()
+        loss_iou = loss_iou * (1 - gamma) + loss_inner * gamma
+        
+        # === L1/DFL loss (same as original) ===
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(
+                pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), 
+                target_ltrb[fg_mask]
+            ) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes)
+            target_ltrb = target_ltrb * stride
+            target_ltrb[..., 0::2] /= imgsz[1]
+            target_ltrb[..., 1::2] /= imgsz[0]
+            pred_dist = pred_dist * stride
+            pred_dist[..., 0::2] /= imgsz[1]
+            pred_dist[..., 1::2] /= imgsz[0]
+            loss_dfl = (
+                F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none")
+                .mean(-1, keepdim=True) * weight
+            )
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        
+        return loss_iou, loss_dfl
+    
 
 
 class v8DetectionLoss:
