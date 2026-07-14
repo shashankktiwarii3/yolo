@@ -127,22 +127,22 @@ class BboxLoss(nn.Module):
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
-        # weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        # iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        # loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-
+        
         # --- NOVEL: Area-Adaptive IoU Loss ---
         pred_fg = pred_bboxes[fg_mask]
         target_fg = target_bboxes[fg_mask]
-        
-        # Calculate areas in image scale (target_bboxes are in feature map scale here)
-        # stride_tensor shape: (num_anchors, 1), fg_mask selects foreground anchors
-        fg_stride = stride[fg_mask] if stride.dim() > 0 else stride
+
+        # FIX: stride is (N, 1). Expand to (B, N, 1) so we can index it with fg_mask (B, N)
+        stride_expanded = stride.unsqueeze(0).expand(fg_mask.shape[0], -1, -1)
+        fg_stride = stride_expanded[fg_mask] # shape: (num_fg, 1)
+
         target_areas_img = ((target_fg[..., 2] - target_fg[..., 0]) * fg_stride.squeeze(-1)) * \
                            ((target_fg[..., 3] - target_fg[..., 1]) * fg_stride.squeeze(-1))
-        tiny_mask_iou = target_areas_img < 1024  # 32x32 pixel threshold
         
+        # Threshold: 32x32 = 1024 pixels
+        tiny_mask_iou = target_areas_img < 1024  
+
         if tiny_mask_iou.any():
             # Compute standard CIoU
             iou_ciou = bbox_iou(pred_fg, target_fg, xywh=False, CIoU=True)
@@ -152,7 +152,7 @@ class BboxLoss(nn.Module):
             iou = torch.where(tiny_mask_iou, iou_nwd, iou_ciou)
         else:
             iou = bbox_iou(pred_fg, target_fg, xywh=False, CIoU=True)
-        
+
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
         # -------------------------------------------------
 
@@ -161,22 +161,6 @@ class BboxLoss(nn.Module):
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
             loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
             loss_dfl = loss_dfl.sum() / target_scores_sum
-        # else:
-        #     target_ltrb = bbox2dist(anchor_points, target_bboxes)
-        #     # normalize ltrb by image size
-        #     target_ltrb = target_ltrb * stride
-        #     target_ltrb[..., 0::2] /= imgsz[1]
-        #     target_ltrb[..., 1::2] /= imgsz[0]
-        #     pred_dist = pred_dist * stride
-        #     pred_dist[..., 0::2] /= imgsz[1]
-        #     pred_dist[..., 1::2] /= imgsz[0]
-        #     loss_dfl = (
-        #         F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
-        #     )
-        #     loss_dfl = loss_dfl.sum() / target_scores_sum
-
-        # return loss_iou, loss_dfl
-
         else:
             target_ltrb = bbox2dist(anchor_points, target_bboxes)
             # normalize ltrb by image size
@@ -192,8 +176,8 @@ class BboxLoss(nn.Module):
             l1_loss = F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True)
             
             # 2. Calculate Target Areas in IMAGE SCALE to identify tiny objects
-            # Note: target_bboxes here are in FEATURE MAP SCALE. We must multiply by stride!
-            target_bboxes_img = target_bboxes * stride
+            # target_bboxes is (B, N, 4), stride is (N, 1). Broadcasting handles this safely.
+            target_bboxes_img = target_bboxes * stride 
             w_gt = target_bboxes_img[..., 2] - target_bboxes_img[..., 0]
             h_gt = target_bboxes_img[..., 3] - target_bboxes_img[..., 1]
             areas_gt = w_gt * h_gt
@@ -202,18 +186,22 @@ class BboxLoss(nn.Module):
             tiny_mask = (areas_gt < 1024)[fg_mask] 
             
             if tiny_mask.any():
-                # Normalize anchor points to [0, 1] space for NWD calculation
-                anchor_points_norm = anchor_points.clone()
-                anchor_points_norm[:, 0] /= imgsz[1]
-                anchor_points_norm[:, 1] /= imgsz[0]
+                # FIX: anchor_points is (N, 2). Expand to (B, N, 2) to match fg_mask (B, N)
+                anchor_points_exp = anchor_points.unsqueeze(0).expand(fg_mask.shape[0], -1, -1)
+                anchor_points_norm = anchor_points_exp.clone()
+                anchor_points_norm[..., 0] /= imgsz[1]
+                anchor_points_norm[..., 1] /= imgsz[0]
+                
+                # Select foreground anchor points safely
+                anchor_points_fg = anchor_points_norm[fg_mask] # (num_fg, 2)
                 
                 # Convert normalized ltrb back to normalized xyxy boxes
-                pred_xyxy_norm = dist2bbox(pred_dist[fg_mask], anchor_points_norm[fg_mask], xywh=False, dim=-1)
-                target_xyxy_norm = dist2bbox(target_ltrb[fg_mask], anchor_points_norm[fg_mask], xywh=False, dim=-1)
+                pred_xyxy_norm = dist2bbox(pred_dist[fg_mask], anchor_points_fg, xywh=False, dim=-1)
+                target_xyxy_norm = dist2bbox(target_ltrb[fg_mask], anchor_points_fg, xywh=False, dim=-1)
                 
-                # Compute NWD (constant=3.0 is mathematically optimal for [0,1] normalized space)
+                # Compute NWD (constant=0.05 is mathematically optimal for [0,1] normalized space)
                 nwd = bbox_nwd(pred_xyxy_norm, target_xyxy_norm, xywh=False, constant=0.05)
-                nwd_loss = -torch.log(nwd + 1e-7)
+                nwd_loss = -torch.log(nwd + 1e-7).unsqueeze(-1)
                 
                 # Hybrid Loss: Use NWD for tiny, L1 for normal
                 hybrid_loss = torch.where(tiny_mask.unsqueeze(-1), nwd_loss, l1_loss)
