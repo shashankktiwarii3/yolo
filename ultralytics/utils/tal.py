@@ -582,12 +582,11 @@ class SAGAAssigner(TaskAlignedAssigner):
         u_star = (g * gsim + (1. - g) * u_iou).clamp(0, 1) * pool
         align = scores.clamp_min(self.eps).pow(self.alpha) * u_star.clamp_min(self.eps).pow(self.beta)
         return align * pool, u_star
-
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
-        mgt = mask_gt.bool()                                # (b,n,1)
+        mgt = mask_gt.bool()
         mask_in = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt).bool()
-        gsim = self._gauss_sim(gt_bboxes, anc_points)       # (b,n,a)
-        gate = self._tiny_gate(gt_bboxes)                   # (b,n)
+        gsim = self._gauss_sim(gt_bboxes, anc_points)
+        gate = self._tiny_gate(gt_bboxes)
         is_tiny = (gate > 0.5) & mgt.squeeze(-1)
 
         valid = mgt.expand_as(gsim)
@@ -596,15 +595,55 @@ class SAGAAssigner(TaskAlignedAssigner):
 
         align, u_star = self._fused_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes,
                                             pool, gsim, gate)
-
-        # exact parity with the installed top-k (same dup-collision guard)
         mask_topk = self.select_topk_candidates(
             align, topk_mask=mask_gt.expand(-1, -1, self.topk).bool()).bool()
         mask_pos = mask_topk & pool
 
-        if self.guarantee:  # zero-positive fix: best-similarity anchor of every tiny GT is positive
-            best = gsim.masked_fill(~valid, -float("inf")).argmax(-1, keepdim=True)
-            forced = torch.zeros_like(mask_pos).scatter_(-1, best, True)
-            mask_pos = mask_pos | (forced & is_tiny.unsqueeze(-1))
-
+        # stash for the post-conflict guarantee  # <<< NEW
+        self._gsim = gsim.masked_fill(~valid, -float("inf"))
+        self._is_tiny = is_tiny
         return mask_pos.to(align.dtype), align, u_star
+
+    def select_highest_overlaps(self, mask_pos, overlaps, n_max_boxes, align_metric):
+        """Parent's conflict resolution, then RE-ASSERT the tiny guarantee.
+
+        The parent resolves anchor<->GT collisions by argmax(u*) over GTs, which in
+        dense scenes hands a tiny GT's only viable anchor to a larger neighbour. We
+        restore it afterwards: every uncovered tiny GT reclaims its argmax-similarity
+        anchor, but only from a donor GT that keeps >=1 positive -- so the guarantee
+        can never create a new zero-positive elsewhere.
+        """
+        target_gt_idx, fg_mask, mask_pos = super().select_highest_overlaps(
+            mask_pos, overlaps, n_max_boxes, align_metric)
+        if not self.guarantee:
+            return target_gt_idx, fg_mask, mask_pos
+
+        mp = mask_pos.bool()                               # (b,n,a)
+        for _ in range(2):                                 # 2 passes settles it in practice
+            covered = mp.any(-1)                           # (b,n)
+            need = self._is_tiny & ~covered                # uncovered tiny GTs
+            if not need.any():
+                break
+            # each needy GT claims its best-similarity anchor
+            best = self._gsim.argmax(-1)                   # (b,n)
+            claim = torch.zeros_like(mp)
+            claim.scatter_(-1, best.unsqueeze(-1), True)
+            claim &= need.unsqueeze(-1)                    # (b,n,a)
+
+            # a claimed anchor may currently belong to a donor GT
+            claimed_anchor = claim.any(-2)                 # (b,a)
+            n_pos = mp.sum(-1, keepdim=True)               # (b,n,1) positives per GT
+            donor = mp & claimed_anchor.unsqueeze(-2) & (n_pos > 1)   # donors that can spare it
+            mp = (mp & ~donor) | claim
+
+            # if two needy GTs claim the SAME anchor, keep the higher-similarity one
+            dup = mp.sum(-2) > 1                           # (b,a)
+            if dup.any():
+                win = self._gsim.masked_fill(~mp, -float("inf")).argmax(-2)   # (b,a)
+                keep = torch.zeros_like(mp).scatter_(-2, win.unsqueeze(-2), True)
+                mp = torch.where(dup.unsqueeze(-2), mp & keep, mp)
+
+        mask_pos = mp.to(mask_pos.dtype)
+        fg_mask = mask_pos.sum(-2)
+        target_gt_idx = mask_pos.argmax(-2)
+        return target_gt_idx, fg_mask, mask_pos
