@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from . import LOGGER
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_iou, probiou, bbox_nwd
 from .ops import xywh2xyxy, xywhr2xyxyxyxy, xyxy2xywh
 from .torch_utils import TORCH_1_11
 
@@ -202,17 +202,39 @@ class TaskAlignedAssigner(nn.Module):
         align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
         return align_metric, overlaps
 
+    # def iou_calculation(self, gt_bboxes, pd_bboxes):
+    #     """Calculate IoU for horizontal bounding boxes.
+
+    #     Args:
+    #         gt_bboxes (torch.Tensor): Ground truth boxes.
+    #         pd_bboxes (torch.Tensor): Predicted boxes.
+
+    #     Returns:
+    #         (torch.Tensor): IoU values between each pair of boxes.
+    #     """
+    #     return bbox_iou(gt_bboxes, pd_bboxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
     def iou_calculation(self, gt_bboxes, pd_bboxes):
-        """Calculate IoU for horizontal bounding boxes.
-
-        Args:
-            gt_bboxes (torch.Tensor): Ground truth boxes.
-            pd_bboxes (torch.Tensor): Predicted boxes.
-
-        Returns:
-            (torch.Tensor): IoU values between each pair of boxes.
-        """
-        return bbox_iou(gt_bboxes, pd_bboxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
+        """Calculate IoU for horizontal bounding boxes with Scale-Decoupled Routing."""
+        # 1. Standard CIoU (Used for normal/large objects)
+        ciou = bbox_iou(gt_bboxes, pd_bboxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
+        
+        # 2. Calculate GT Areas to identify tiny objects
+        # Note: In Ultralytics, gt_bboxes passed to the assigner are in IMAGE SCALE (pixels)
+        w_gt = gt_bboxes[:, 2] - gt_bboxes[:, 0]
+        h_gt = gt_bboxes[:, 3] - gt_bboxes[:, 1]
+        areas_gt = w_gt * h_gt
+        
+        # Threshold for tiny objects (e.g., 32x32 = 1024 pixels)
+        tiny_mask = areas_gt < 1024 
+        
+        if tiny_mask.any():
+            # 3. Compute NWD for tiny objects (constant=3.0 is optimal for image scale)
+            nwd = bbox_nwd(gt_bboxes, pd_bboxes, xywh=False, constant=12.0).squeeze(-1)
+            
+            # 4. Scale-Decoupled Routing: Use NWD for tiny, CIoU for normal
+            return torch.where(tiny_mask, nwd, ciou)
+            
+        return ciou
 
     def select_topk_candidates(self, metrics, topk_mask=None):
         """Select the top-k candidates based on the given metrics.

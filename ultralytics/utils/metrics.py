@@ -146,6 +146,34 @@ def bbox_iou(
         return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
     return iou  # IoU
 
+def bbox_nwd(box1, box2, xywh=False, eps=1e-7, constant=3.0):
+    """
+    Normalized Wasserstein Distance for bounding boxes.
+    Mathematically simplified W2^2 for diagonal covariance matrices to avoid matrix square roots.
+    """
+    if xywh:
+        b1_x1, b1_y1 = box1[..., 0] - box1[..., 2] / 2, box1[..., 1] - box1[..., 3] / 2
+        b1_x2, b1_y2 = box1[..., 0] + box1[..., 2] / 2, box1[..., 1] + box1[..., 3] / 2
+        b2_x1, b2_y1 = box2[..., 0] - box2[..., 2] / 2, box2[..., 1] - box2[..., 3] / 2
+        b2_x2, b2_y2 = box2[..., 0] + box2[..., 2] / 2, box2[..., 1] + box2[..., 3] / 2
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        
+    # Centers and Dimensions
+    c1_x, c1_y = (b1_x1 + b1_x2) / 2, (b1_y1 + b1_y2) / 2
+    c2_x, c2_y = (b2_x1 + b2_x2) / 2, (b2_y1 + b2_y2) / 2
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
+    
+    # Simplified W2^2 calculation
+    center_dist_sq = (c1_x - c2_x).pow(2) + (c1_y - c2_y).pow(2)
+    wh_dist_sq = ((w1 - w2).pow(2) + (h1 - h2).pow(2)) / 4.0
+    w2_sq = center_dist_sq + wh_dist_sq
+    
+    # NWD = exp(-sqrt(W2^2) / C)
+    nwd = torch.exp(-torch.sqrt(w2_sq + eps) / constant)
+    return nwd
 
 def mask_iou(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """Calculate masks IoU.
