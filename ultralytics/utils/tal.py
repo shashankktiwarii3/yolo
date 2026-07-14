@@ -386,8 +386,8 @@ class TaskAlignedAssigner(nn.Module):
         threshold = 0.5 / scale_factor.unsqueeze(-1)  # lower threshold for tiny objects
         mask = rfd > threshold
         
-        # Apply ground truth mask
-        mask = mask & mask_gt.squeeze(-1).bool()
+        # REMOVED: mask = mask & mask_gt.squeeze(-1).bool()
+        # mask_gt is applied automatically in get_pos_mask() later
         
         return mask
 
