@@ -2100,7 +2100,7 @@ class RealNVP(nn.Module):
 
 
 import torch, torch.nn as nn, torch.nn.functional as F
-from ultralytics.nn.modules import Conv
+from ultralytics.nn.modules.conv import Conv  # Notice the added .conv
 
 # ---------- B3: TRULY frozen Laplacian high-pass ----------
 class HighFreqInject(nn.Module):
