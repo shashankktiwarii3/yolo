@@ -109,10 +109,21 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
-        """Initialize the BboxLoss module with regularization maximum and DFL settings."""
+    def __init__(self, reg_max: int = 16, snsp: bool = False, snsp_eps: float = 1e-2):
+        """Initialize the BboxLoss module with regularization maximum and DFL settings.
+
+        Args:
+            reg_max (int): DFL bins. >1 enables DFL; ==1 (YOLO26) enables direct L1 regression.
+            snsp (bool): Enable Stride-Normalized Sub-pixel loss for the DFL-free L1 branch. Upweights the
+                L1 gradient on sub-stride targets so that tiny boxes produce non-vanishing gradients despite
+                DFL removal. No effect when reg_max > 1 (vanilla DFL branch is untouched).
+            snsp_eps (float): Stabilizer inside the per-anchor normalizer sqrt(|target|/stride + eps).
+                Larger eps => milder amplification. Suggested 1e-2 to 1e-1.
+        """
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.snsp = snsp
+        self.snsp_eps = snsp_eps
 
     def forward(
         self,
@@ -145,9 +156,27 @@ class BboxLoss(nn.Module):
             pred_dist = pred_dist * stride
             pred_dist[..., 0::2] /= imgsz[1]
             pred_dist[..., 1::2] /= imgsz[0]
-            loss_dfl = (
-                F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
-            )
+            if self.snsp:
+                # Stride-Normalized Sub-pixel loss (SNSP).
+                # The vanilla DFL-free L1 has gradient magnitude proportional to |target - pred|, which vanishes
+                # for sub-stride objects (small box => anchor-relative target ~ 0). DFL would have smoothed this
+                # via categorical bins; direct L1 does not. SNSP rescales each foreground anchor's L1 by the
+                # inverse geometric mean of its (positive) target magnitudes, in normalized image coordinates,
+                # so a 4-px object at P3 produces the same effective gradient as a 64-px object at P3.
+                # Per-anchor normalizer: g_j = 1 / sqrt(mean(|ltrb_j|) + eps). Bounded both ways:
+                #   - sub-stride targets (mean << 1): g_j grows, amplifying tiny-object gradients
+                #   - large targets  (mean >> 1): g_j shrinks, mild down-weighting keeps overall scale stable
+                tgt_fg = target_ltrb[fg_mask]                       # (N_fg, 4), normalized coords
+                normalizer = 1.0 / torch.sqrt(tgt_fg.abs().mean(-1, keepdim=True) + self.snsp_eps)  # (N_fg, 1)
+                loss_dfl = (
+                    F.l1_loss(pred_dist[fg_mask], tgt_fg, reduction="none")
+                    .mean(-1, keepdim=True) * normalizer * weight
+                )
+            else:
+                loss_dfl = (
+                    F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True)
+                    * weight
+                )
             loss_dfl = loss_dfl.sum() / target_scores_sum
 
         return loss_iou, loss_dfl
@@ -349,6 +378,9 @@ class v8DetectionLoss:
 
         self.use_dfl = m.reg_max > 1
 
+        # SC-STAL (research): read from hyp so it is overridable via args.yaml / CLI
+        sc_stal = bool(getattr(h, "sc_stal", True))
+        sc_stal_beta = float(getattr(h, "sc_stal_beta", 1.0))
         self.assigner = TaskAlignedAssigner(
             topk=tal_topk,
             num_classes=self.nc,
@@ -356,8 +388,12 @@ class v8DetectionLoss:
             beta=6.0,
             stride=self.stride.tolist(),
             topk2=tal_topk2,
+            sc_stal=sc_stal,
+            sc_stal_beta=sc_stal_beta,
         )
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        snsp = bool(getattr(h, "snsp", True))
+        snsp_eps = float(getattr(h, "snsp_eps", 1e-2))
+        self.bbox_loss = BboxLoss(m.reg_max, snsp=snsp, snsp_eps=snsp_eps).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
