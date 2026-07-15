@@ -34,11 +34,9 @@ class TaskAlignedAssigner(nn.Module):
         num_classes: int = 80,
         alpha: float = 1.0,
         beta: float = 6.0,
-        stride: list | None = None,
+        stride: list = [8, 16, 32],
         eps: float = 1e-9,
         topk2=None,
-        sc_stal: bool = False,
-        sc_stal_beta: float = 1.0,
     ):
         """Initialize a TaskAlignedAssigner object with customizable hyperparameters.
 
@@ -50,11 +48,6 @@ class TaskAlignedAssigner(nn.Module):
             stride (list, optional): List of stride values for different feature levels.
             eps (float, optional): A small value to prevent division by zero.
             topk2 (int, optional): Secondary topk value for additional filtering.
-            sc_stal (bool, optional): Enable Scale-Conditioned STAL. When False, behavior is identical to vanilla
-                YOLO26 STAL (static s_ref = stride_val). When True, s_ref is widened per-object proportional to
-                the gap between the object's largest side and s_min, controlled by sc_stal_beta.
-            sc_stal_beta (float, optional): Widening rate for SC-STAL. s_ref(i) = s_min * (1 + beta * (1 - d_i/s_min)).
-                beta=0 reduces to vanilla STAL. Suggested range 0.5-2.0.
         """
         super().__init__()
         self.topk = topk
@@ -62,11 +55,9 @@ class TaskAlignedAssigner(nn.Module):
         self.num_classes = num_classes
         self.alpha = alpha
         self.beta = beta
-        self.stride = stride if stride is not None else [8, 16, 32]
+        self.stride = stride
         self.stride_val = self.stride[1] if len(self.stride) > 1 else self.stride[0]
         self.eps = eps
-        self.sc_stal = sc_stal
-        self.sc_stal_beta = sc_stal_beta
 
     @torch.no_grad()
     def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
@@ -313,27 +304,11 @@ class TaskAlignedAssigner(nn.Module):
         """
         gt_bboxes_xywh = xyxy2xywh(gt_bboxes)
         wh_mask = gt_bboxes_xywh[..., 2:] < self.stride[0]  # the smallest stride
-        if self.sc_stal:
-            # Scale-Conditioned STAL: widen each sub-stride object by an amount proportional to how far below
-            # s_min it is, instead of clamping every such object to a single fixed s_ref.
-            #   s_ref(i) = s_min * (1 + beta * (1 - d_i / s_min)),  d_i = max(w_i, h_i)
-            # A 2px object at s_min=8 widens to 8*(1+beta*0.75); a 7px object widens to 8*(1+beta*0.125).
-            # beta=0 collapses to vanilla STAL (s_ref = s_min = stride_val equivalent only when stride_val=s_min;
-            # to exactly reproduce vanilla, use beta such that s_ref == stride_val, i.e. disable sc_stal).
-            d = gt_bboxes_xywh[..., 2:].max(-1, keepdim=True).values  # (b, n_boxes, 1) max side
-            scale = 1.0 + self.sc_stal_beta * (1.0 - d / self.stride[0]).clamp_(min=0.0)
-            s_ref = self.stride[0] * scale  # (b, n_boxes, 1)
-            # Broadcast per-object s_ref to both w and h channels; only apply where wh_mask & mask_gt
-            stal_ref = s_ref.expand_as(gt_bboxes_xywh[..., 2:])  # (b, n_boxes, 2)
-            apply_mask = (wh_mask * mask_gt).bool()
-            gt_bboxes_xywh[..., 2:] = torch.where(apply_mask, stal_ref, gt_bboxes_xywh[..., 2:])
-        else:
-            # Vanilla YOLO26 STAL: static s_ref = stride_val (next stride, default 16)
-            gt_bboxes_xywh[..., 2:] = torch.where(
-                (wh_mask * mask_gt).bool(),
-                torch.tensor(self.stride_val, dtype=gt_bboxes_xywh.dtype, device=gt_bboxes_xywh.device),
-                gt_bboxes_xywh[..., 2:],
-            )
+        gt_bboxes_xywh[..., 2:] = torch.where(
+            (wh_mask * mask_gt).bool(),
+            torch.tensor(self.stride_val, dtype=gt_bboxes_xywh.dtype, device=gt_bboxes_xywh.device),
+            gt_bboxes_xywh[..., 2:],
+        )
         gt_bboxes = xywh2xyxy(gt_bboxes_xywh)
 
         n_anchors = xy_centers.shape[0]
