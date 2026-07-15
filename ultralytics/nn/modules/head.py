@@ -251,36 +251,6 @@ class Detect(nn.Module):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
 
-class BoxRealNVP(nn.Module):
-    """4-D RealNVP over (l,t,r,b) residuals. Train-only. Fallback if block.RealNVP is 2-D-fixed."""
-    class _C(nn.Module):
-        def __init__(self, dim, mask, hidden=64):
-            super().__init__()
-            self.register_buffer("mask", mask.float())
-            self.s = nn.Sequential(nn.Linear(dim, hidden), nn.LeakyReLU(.1),
-                                   nn.Linear(hidden, hidden), nn.LeakyReLU(.1),
-                                   nn.Linear(hidden, dim), nn.Tanh())
-            self.t = nn.Sequential(nn.Linear(dim, hidden), nn.LeakyReLU(.1),
-                                   nn.Linear(hidden, hidden), nn.LeakyReLU(.1),
-                                   nn.Linear(hidden, dim))
-        def forward(self, x):
-            xm = x * self.mask
-            s = self.s(xm) * (1 - self.mask)
-            t = self.t(xm) * (1 - self.mask)
-            return xm + (1 - self.mask) * (x * torch.exp(s) + t), s.sum(-1)
-
-    def __init__(self, dim=4, n_pairs=3, hidden=64):
-        super().__init__()
-        m = torch.zeros(dim); m[: dim // 2] = 1.0
-        self.layers = nn.ModuleList(
-            self._C(dim, m if i % 2 == 0 else 1 - m, hidden) for i in range(2 * n_pairs))
-        self.dim = dim
-
-    def log_prob(self, x):
-        z, ld = x, torch.zeros(x.shape[:-1], device=x.device, dtype=x.dtype)
-        for l in self.layers:
-            z, d = l(z); ld = ld + d
-        return -0.5 * (z.pow(2).sum(-1) + self.dim * math.log(2 * math.pi)) + ld
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.

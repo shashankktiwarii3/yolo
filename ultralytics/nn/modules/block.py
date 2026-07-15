@@ -2066,7 +2066,6 @@ class RealNVP(nn.Module):
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
 
-
 class HighFreqInject(nn.Module):
     """Injects high-frequency spatial details from a higher-resolution feature map (e.g., P2) into a lower-resolution map (e.g., P3)."""
     
