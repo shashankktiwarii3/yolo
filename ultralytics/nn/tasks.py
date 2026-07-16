@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import HighFreqInject, P2Skip, LearnInject, LapInitInject
+from ultralytics.nn.modules.block import HighFreqInject, P2Skip, LearnInject, LapInitInject, GatedInject
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1636,7 +1636,7 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in {HighFreqInject, P2Skip, LearnInject, LapInitInject}:
+        if m in {HighFreqInject, P2Skip, LearnInject, LapInitInject, GatedInject}:
             c1 = ch[f[1]]
             c2 = ch[f[0]]
             args = [c1, c2, *args]     # <-- append YAML flags so [use_gate, use_unsharp] flow through

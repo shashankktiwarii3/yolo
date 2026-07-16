@@ -2153,3 +2153,15 @@ class LapInitInject(nn.Module):
     def forward(self, x):
         target, source = x[0], x[1]
         return target + self.proj(self.dw(source))
+    
+class GatedInject(nn.Module):
+    """P2->P3 injection with a learned spatial gate. Suppresses background
+    injection, keeps object-region detail. Targets the additive-fusion plateau."""
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.proj = Conv(c1, c2, k=3, s=2)          # P2 -> P3 channels + downsample
+        self.gate = nn.Conv2d(c1, c1, 1)            # cheap 1x1 spatial gate on source
+    def forward(self, x):
+        target, source = x[0], x[1]
+        g = torch.sigmoid(self.gate(source))        # (B, c1, H, W) in [0,1]
+        return target + self.proj(g * source)       # gated, then projected
